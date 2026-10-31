@@ -1,0 +1,1 @@
+javascript:(()=>{fetch("https://raw.githubusercontent.com/supermanone-boop/geofs-scripts-bookmarklet-box/refs/heads/main/coaster_expansion_launcher_v10.js",{cache:"no-store"}).then(r=>{if(!r.ok)throw Error(r.status);return r.text()}).then(eval).catch(e=>alert("起動失敗: "+e))})()
