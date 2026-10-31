@@ -23,7 +23,7 @@ const GAME_URL = location.origin + location.pathname.replace(/index\.html$/, '')
 const HASHTAG = 'ジェットコースターを作ろう';
 const SAVE_KEY = 'rc_design';
 // ゲームのバージョン（タイトル画面の右下に出す）。public/coaster/ のソースを変えるコミットごとに末尾（パッチ）を 1 つ上げる
-const VERSION = '1.2.0 + 拡張2.3';
+const VERSION = '1.2.0 + 拡張2.4';
 const verEl = document.getElementById('ver');
 if (verEl) verEl.textContent = `ver ${VERSION}`;
 

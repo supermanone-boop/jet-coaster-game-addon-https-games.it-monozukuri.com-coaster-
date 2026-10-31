@@ -1011,7 +1011,7 @@ export class Editor {
     c.font = `600 10px ${FONT}`;
     c.textAlign = 'right';
     c.textBaseline = 'middle';
-    const hStep = Hmax <= 100 ? 10 : Hmax <= 300 ? 20 : Hmax <= 1000 ? 100 : Hmax <= 5000 ? 500 : 1000;
+    const hStep = X.Hmax <= 100 ? 10 : X.Hmax <= 300 ? 20 : X.Hmax <= 1000 ? 100 : X.Hmax <= 5000 ? 500 : 1000;
     for (let h = 0; h <= X.Hmax; h += hStep) {
       const y = X.hy(h);
       c.beginPath();
