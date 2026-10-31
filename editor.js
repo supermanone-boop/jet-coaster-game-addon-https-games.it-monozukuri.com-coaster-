@@ -664,9 +664,10 @@ export class Editor {
     const padB = 26;
     const w = this.W - padL - padR;
     const h = this.H - padT - padB;
-    const Hmax = H_MAX;
+    const maxDesignH = Math.max(2, ...(this.design.hs || [30]));
+    const Hmax = Math.min(H_MAX, Math.max(60, Math.ceil((maxDesignH * 1.5) / 10) * 10));
     return {
-      x0: padL, y0: padT, w, h,
+      x0: padL, y0: padT, w, h, Hmax,
       ux: (u) => padL + u * w,
       hy: (hh) => padT + h - (hh / Hmax) * h,
       toU: (sx) => clamp((sx - padL) / w, 0, 1),
@@ -1010,7 +1011,8 @@ export class Editor {
     c.font = `600 10px ${FONT}`;
     c.textAlign = 'right';
     c.textBaseline = 'middle';
-    for (let h = 0; h <= H_MAX; h += 10) {
+    const hStep = Hmax <= 100 ? 10 : Hmax <= 300 ? 20 : Hmax <= 1000 ? 100 : Hmax <= 5000 ? 500 : 1000;
+    for (let h = 0; h <= X.Hmax; h += hStep) {
       const y = X.hy(h);
       c.beginPath();
       c.moveTo(X.x0, y);

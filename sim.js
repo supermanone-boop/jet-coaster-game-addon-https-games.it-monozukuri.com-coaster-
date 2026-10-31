@@ -16,7 +16,6 @@ const BRAKE_V = 9;
 const ST_BRAKE_A = 12;
 const FRIC = 0.12;
 const DRAG = 0.0004;
-const MAX_T = 160;
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 
 // 線路の上の位置 s（m）の値を、隣の点との直線補間で out に入れる
@@ -174,7 +173,6 @@ export class Sim {
     if (this.mode !== 'done') {
       if (this.mode === 'crash' && this.crashT > 7 && this.settled()) this.finish();
       else if (this.mode === 'crash' && this.crashT > 14) this.finish();
-      else if (this.t > MAX_T) this.finish('stuck');
     } else this.endT += dt;
   }
 
@@ -673,8 +671,10 @@ export class Sim {
   }
 
   // 最後までまとめて進める（スキップ・試算用）
-  runToEnd(maxT = MAX_T + 20) {
-    while (this.mode !== 'done' && this.t < maxT) this.step();
+  runToEnd(_legacyMaxT = Infinity) {
+    // 旧版の時間上限は撤廃。停止・逆走・衝突などの自然な終了判定まで進める。
+    // _legacyMaxT は旧コードとの互換性のため受け取るが、時間制限には使わない。
+    while (this.mode !== 'done') this.step();
     return this.summary();
   }
 
@@ -815,7 +815,7 @@ export function addBrakesUntilSafe(design, buildTrack, maxAdd = 5) {
     const sim = new Sim(tr, d);
     // 1 周目にいちばん先まで進んだ所（坂を登りきれずに駅まで戻ったときに使う）
     let far = 0;
-    while (sim.mode !== 'done' && sim.t < MAX_T + 20) {
+    while (sim.mode !== 'done') {
       sim.step();
       if (!sim.lap && sim.s > far) far = sim.s;
     }

@@ -8,7 +8,7 @@
 import { H_SAMPLES, H_MAX, H_MIN, FIELD, GIMMICK_KEYS, MATS, BARS, STARTS, MAX_GIMMICKS, MAX_CARS, MAPS } from './track.js';
 import { cleanLook, defaultLook } from './looks.js';
 
-const VER = 2;
+const VER = 3;
 const MAX_POINTS = 8192;
 const MAX_CODE_LENGTH = 180000;
 const OX_V1 = 80; // 旧共有URLの座標オフセット
@@ -92,7 +92,7 @@ export function encode(d) {
     const u = Math.round(Math.min(1, Math.max(0, g.u)) * 4095);
     out.push(GIMMICK_KEYS.indexOf(g.t), u >> 8, u & 255);
   }
-  for (let k = 0; k < H_SAMPLES; k++) out.push(Math.round(Math.min(H_MAX, Math.max(H_MIN, d.hs[k] ?? 2)) * 2));
+  for (let k = 0; k < H_SAMPLES; k++) varint(out, Math.round(Math.min(H_MAX, Math.max(H_MIN, d.hs[k] ?? 2)) * 2));
   const pts = d.pts.slice(0, MAX_POINTS);
   out.push(pts.length >> 8, pts.length & 255);
   let px = 0;
@@ -123,7 +123,7 @@ export function decode(str) {
       return b[r.i++];
     };
     const version = rd();
-    if (version !== 1 && version !== VER) return null;
+    if (version !== 1 && version !== 2 && version !== VER) return null;
     const offset = version === 1 ? OX_V1 : OX_V2;
     const f = rd();
     const d = { mat: f & 3, bar: (f >> 2) & 3, start: (f >> 4) & 3, cars: rd(), gm: [], hs: [], pts: [] };
@@ -137,7 +137,10 @@ export function decode(str) {
       if (!t) return null;
       d.gm.push({ t, u });
     }
-    for (let k = 0; k < H_SAMPLES; k++) d.hs.push(Math.min(H_MAX, Math.max(H_MIN, rd() / 2)));
+    for (let k = 0; k < H_SAMPLES; k++) {
+      const rawHeight = version >= 3 ? readVarint(r) : rd();
+      d.hs.push(Math.min(H_MAX, Math.max(H_MIN, rawHeight / 2)));
+    }
     const n = (rd() << 8) | rd();
     if (n < 2 || n > MAX_POINTS) return null;
     let px = 0;
