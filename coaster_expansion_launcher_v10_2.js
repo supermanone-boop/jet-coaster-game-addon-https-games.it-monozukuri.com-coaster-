@@ -1,6 +1,6 @@
 (async () => {
   'use strict';
-  const ROOT='https://raw.githubusercontent.com/supermanone-boop/jet-coaster-game-addon-https.games.it-monozukuri.com-coaster-/refs/heads/main/';
+  const ROOT='https://raw.githubusercontent.com/supermanone-boop/jet-coaster-game-addon-https-games.it-monozukuri.com-coaster-/refs/heads/main/';
   const FILES=['main.js','track.js','editor.js','world.js','codec.js','coaster_expansion.js','coaster_architecture.js','coaster_city_flight.js','sim.js'];
   const KEY='__coasterExpansionLauncherV102';
   function show(message,error=false){let el=document.getElementById('coaster-expansion-launcher-message');if(!el){el=document.createElement('div');el.id='coaster-expansion-launcher-message';el.style.cssText='position:fixed;z-index:2147483647;left:10px;right:10px;top:10px;padding:12px 14px;border-radius:9px;background:#152238;color:#fff;font:14px/1.5 system-ui;box-shadow:0 3px 18px #0005;white-space:pre-wrap;overflow-wrap:anywhere';document.body.appendChild(el);}el.style.background=error?'#8b2525':'#152238';el.textContent=message;}
