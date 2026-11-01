@@ -344,7 +344,7 @@ export class Editor {
       this.hint.textContent = !drawn ? '指で山を描こう！ 描きにくければ「おまかせ」' : d.start > 0 ? '指でなぞると高さが変わる。駅を出てすぐ発射で一気に加速します' : '指でなぞると高さが変わる。最初の坂は巻き上げ（チェーン）で登ります';
       this.btnNext.disabled = !drawn;
     } else if (this.step === 3) {
-      this.hint.textContent = 'しかけを選んで、図をタップして置く（置いたものをタップで外す）。置かなくても走れます';
+      this.hint.textContent = `しかけを選んで、図をタップして置く（置いたものをタップで外す）。${d.gm.length}/${MAX_GIMMICKS}個・置かなくても走れます`;
       this.btnNext.disabled = !p;
     } else {
       this.hint.textContent = '線路の強さ・安全バー・車両の数・スタートのしかたで、結果が大きく変わります';
@@ -664,14 +664,15 @@ export class Editor {
     const padB = 26;
     const w = this.W - padL - padR;
     const h = this.H - padT - padB;
-    const maxDesignH = Math.max(2, ...(this.design.hs || [30]));
-    const Hmax = Math.min(H_MAX, Math.max(60, Math.ceil((maxDesignH * 1.5) / 10) * 10));
+    const heights = this.design && Array.isArray(this.design.hs) ? this.design.hs : [];
+    const currentMax = heights.reduce((m, v) => Number.isFinite(v) ? Math.max(m, v) : m, 2);
+    const Hmax = Math.max(60, Math.ceil((currentMax + 20) / 10) * 10);
     return {
       x0: padL, y0: padT, w, h, Hmax,
       ux: (u) => padL + u * w,
       hy: (hh) => padT + h - (hh / Hmax) * h,
       toU: (sx) => clamp((sx - padL) / w, 0, 1),
-      toH: (sy) => clamp(((padT + h - sy) / h) * Hmax, H_MIN, H_MAX),
+      toH: (sy) => clamp(((padT + h - sy) / h) * Hmax, H_MIN, Hmax),
     };
   }
 
@@ -1011,7 +1012,7 @@ export class Editor {
     c.font = `600 10px ${FONT}`;
     c.textAlign = 'right';
     c.textBaseline = 'middle';
-    const hStep = X.Hmax <= 100 ? 10 : X.Hmax <= 300 ? 20 : X.Hmax <= 1000 ? 100 : X.Hmax <= 5000 ? 500 : 1000;
+    const hStep = Math.max(10, Math.ceil(X.Hmax / 6 / 10) * 10);
     for (let h = 0; h <= X.Hmax; h += hStep) {
       const y = X.hy(h);
       c.beginPath();
@@ -1281,7 +1282,10 @@ export class Editor {
       const u = X.toU(sx);
       // 近くのしかけをタップ → 外す
       const near = d.gm.findIndex((g) => Math.abs(X.ux(g.u) - sx) < 16);
-      if (near < 0 && d.gm.length >= MAX_GIMMICKS) this.undoStack.pop(); // 何も変わらない
+      if (near < 0 && d.gm.length >= MAX_GIMMICKS) {
+        this.undoStack.pop(); // 何も変わらない
+        this.toast(`しかけは最大${MAX_GIMMICKS}個です`, '', 'warn', 1800);
+      }
       if (near >= 0) {
         d.gm.splice(near, 1);
         sound.sfx('erase');

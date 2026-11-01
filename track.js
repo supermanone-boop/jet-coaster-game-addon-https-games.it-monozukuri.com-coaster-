@@ -11,7 +11,7 @@ export const ST_LEN = STATION.x1 - STATION.x0;
 export const DS = 0.5; // 線路の点の間隔（m）
 export const H_SAMPLES = 96; // 高さの手書きを何点で持つか
 export const H_MIN = 1.0;
-export const H_MAX = 10000; // 高さ上限を大幅拡張（共有データはv3の可変長数値で保存）
+export const H_MAX = Infinity;
 export const CHUNK = 20; // 線路を何点ずつのかたまりで作るか（10 m。壊れるときの単位）
 export const MIN_R = 3; // 上から見たカーブの最小半径（m）。急なカーブも描いたとおりに作り、物理の結果に任せる（0.1.5 で 6 m、0.1.11 で 3 m。せまいヘアピンを描くと、半径 6 m では外にふくらんだ輪になり、となりの線路とぶつかった）
 export const ST_R = 15.75; // 駅に戻るつなぎ（Dubins 曲線）の半径（m）
@@ -75,8 +75,7 @@ export const GIMMICKS = {
   jump: { name: 'ジャンプ', len: 14, cost: 300, color: '#a14aff' },
 };
 export const GIMMICK_KEYS = Object.keys(GIMMICKS);
-// 共有データの個数欄は1バイト。余裕を持たせ、しかけは最大128個まで配置可能。
-export const MAX_GIMMICKS = 128;
+export const MAX_GIMMICKS = 128; // v10.1: 仕掛けは最大128個
 export const BUDGET = 10000; // 予算（万円）。0.1.10 で上限としては使わなくなった（結果の画面の「建設費」の目安だけ）
 export const MAX_LEN = 5000; // 拡張版：最大 5 km。極端な負荷を避けるため、無制限にはしない
 export const BASE_COST = 1000; // 駅と車両の基本（万円）
@@ -1028,16 +1027,20 @@ function makeChunks(tr) {
 }
 export const chunkOf = (i) => Math.floor(i / CHUNK);
 
-// 支柱（6 m ごと。線路が上を向いている所だけ）
+// 支柱。低い区間は密に、高い区間は間隔を広げる（高架でメッシュが爆発するのを防ぐ）。
 function makeSupports(tr) {
   tr.supports = [];
-  const step = Math.round(6 / DS);
-  for (let i = 0; i < tr.n; i += step) {
+  let nextAt = 0;
+  for (let i = 0; i < tr.n; i++) {
     if (tr.fl[i] & (F.STATION | F.GAP)) continue;
     if (tr.uy[i] < 0.45) continue;
-    const y = tr.py[i] - tr.uy[i] * 0.55;
-    if (y < 0.6) continue;
+    const y = Math.max(0, tr.py[i] - tr.uy[i] * 0.55);
+    if (y < 0.6 || i < nextAt) continue;
+    // 高さに応じて 6 / 10 / 16 / 24 / 36 / 48 m 間隔。
+    // 600 m 級以上で全区間を 6 m 間隔にすると、木製支柱の補強材が過剰になる。
+    const spacing = y < 30 ? 6 : y < 80 ? 10 : y < 180 ? 16 : y < 350 ? 24 : y < 700 ? 36 : 48;
     tr.supports.push(i);
+    nextAt = i + Math.max(1, Math.round(spacing / DS));
   }
 }
 
