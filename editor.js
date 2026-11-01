@@ -717,6 +717,8 @@ export class Editor {
     c.strokeRect(ax, ay, aw, ah);
     c.setLineDash([]);
     this.drawMapLand(toS, k);
+    // 都市モードでは、3D生成に使った建物フットプリントを同じ座標で重ねる。
+    this.drawCityBuildings(toS, k);
     // 駅
     const [s0x, s0y, sw, sh] = this.rectS(toS, STATION.x0, STATION.z - 3, STATION.x1, STATION.z + 3);
     c.fillStyle = '#ffd9df';
@@ -865,6 +867,63 @@ export class Editor {
 
   // ① で、高さを描いたあとは、線路を予想の速さの色の帯で出し、速い所に速さを書く（1.0.15。オーナーの判断：
   // 1.0.11〜1.0.14 は高さの色だったが、カーブの事故は速さで決まるので、速さのほうが分かりやすい）
+  // 都市モードの建物を、実際の3D配置と同じ座標・向き・ footprint で平面図に表示する。
+  drawCityBuildings(toS, k) {
+    if (!document.body || document.body.dataset.coasterCourseMode !== 'city') return;
+    const getFootprints = this.getCityBuildingFootprints;
+    if (typeof getFootprints !== 'function') return;
+    const buildings = getFootprints();
+    if (!Array.isArray(buildings) || !buildings.length) return;
+
+    const c = this.cx;
+    const [fx, fy, fw, fh] = this.rectS(toS, FIELD.x0, FIELD.z0, FIELD.x1, FIELD.z1);
+    let shown = 0;
+    c.save();
+    c.beginPath();
+    c.rect(fx, fy, fw, fh);
+    c.clip();
+    for (const b of buildings) {
+      const halfW = Number(b.halfW), halfD = Number(b.halfD);
+      const x = Number(b.x), z = Number(b.z), yaw = Number(b.yaw) || 0;
+      if (![halfW, halfD, x, z].every(Number.isFinite) || halfW <= 0 || halfD <= 0) continue;
+      // Skip buildings whose footprint cannot intersect the editor's park boundary.
+      const radius = Math.hypot(halfW, halfD) + 2;
+      if (x + radius < FIELD.x0 || x - radius > FIELD.x1 || z + radius < FIELD.z0 || z - radius > FIELD.z1) continue;
+
+      const co = Math.cos(yaw), si = Math.sin(yaw);
+      const corners = [
+        [-halfW, -halfD], [halfW, -halfD], [halfW, halfD], [-halfW, halfD]
+      ].map(([lx, lz]) => toS(x + lx * co + lz * si, z - lx * si + lz * co));
+      c.beginPath();
+      c.moveTo(corners[0][0], corners[0][1]);
+      for (let i = 1; i < corners.length; i++) c.lineTo(corners[i][0], corners[i][1]);
+      c.closePath();
+      const height = Number(b.height) || 0;
+      c.fillStyle = height >= 500 ? 'rgba(105,126,139,0.88)' : height >= 180 ? 'rgba(143,158,164,0.88)' : 'rgba(185,190,184,0.92)';
+      c.strokeStyle = 'rgba(66,79,86,0.95)';
+      c.lineWidth = Math.max(0.75, Math.min(2, k * 0.38));
+      c.fill();
+      c.stroke();
+      shown++;
+    }
+    c.restore();
+
+    // Small legend matching the original map's restrained color palette.
+    c.save();
+    c.font = `700 10px ${FONT}`;
+    c.textAlign = 'right';
+    c.textBaseline = 'top';
+    const legend = `■ 敷地内の建物 ${shown}棟`;
+    const tx = Math.min(this.W - 8, fx + fw - 5);
+    const ty = Math.max(5, fy + 5);
+    c.lineWidth = 3;
+    c.strokeStyle = 'rgba(251,248,239,0.96)';
+    c.strokeText(legend, tx, ty);
+    c.fillStyle = '#52636d';
+    c.fillText(legend, tx, ty);
+    c.restore();
+  }
+
   // マップの水（池・プール）とテーマの飾り。敷地の外は描かない
   drawMapLand(toS, k) {
     const c = this.cx;

@@ -1407,7 +1407,7 @@ export function installCoasterExpansion(api, helpers) {
   mountNativeUI();
 
   api.expansion={
-    version:'10.1',models,architecture:architecturePack,cityFlight:cityFlightPack,
+    version:'10.2',models,architecture:architecturePack,cityFlight:cityFlightPack,
     exportGLB:async()=>{
       if(typeof api.createTrackExportGroup!=='function')throw new Error('GLB出力APIがありません');
       const built=api.createTrackExportGroup(editor.design);

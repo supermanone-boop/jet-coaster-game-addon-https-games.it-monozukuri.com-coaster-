@@ -46,6 +46,7 @@ export function installCityFlight(api, editor, panel) {
   let mountainClock = 0;
   let routeCache = null;
   let colliders = [];
+  let mapFootprintCache = [];
   let traffic = [];
   let cityClock = 0;
   let flight = null;
@@ -496,6 +497,7 @@ export function installCityFlight(api, editor, panel) {
     const bounds={minX:Math.min(...corners.map(q=>q.x)),maxX:Math.max(...corners.map(q=>q.x)),minZ:Math.min(...corners.map(q=>q.z)),maxZ:Math.max(...corners.map(q=>q.z))};
     const airport=addAirport(B,root,bounds,center);
     B.finish();
+    rebuildMapFootprintCache();
 
     // Build detailed cars once; each vehicle follows one straight, marked street lane.
     const carPaint=[0xb93f3b,0xe3e5e2,0x3f6f9a,0xd5a849,0x2d343a,0x597d69,0x7d7194];
@@ -542,6 +544,9 @@ export function installCityFlight(api, editor, panel) {
     if(scene.fog)scene.fog.far=Math.max(scene.fog.far||0,worldFar);
     if(api.camera.far<worldFar){api.camera.far=worldFar;api.camera.updateProjectionMatrix();}
     setStatus(`整然とした都市を生成：${buildingCount}棟／公園${parkCount}区画／格子道路${roadCounts.u+roadCounts.v}本／車両${traffic.length}台。レール周辺は8m以上を確保。`);
+    // The editor's upper plan map uses the same X/Z coordinates as the generated city.
+    // Redraw immediately so the real building footprints appear as soon as the city is built.
+    if (editor && typeof editor.draw === 'function' && editor.step === 1) editor.draw();
     return cityConfig;
   }
   function disposeCity(){
@@ -553,7 +558,7 @@ export function installCityFlight(api, editor, panel) {
         const ms=Array.isArray(o.material)?o.material:[o.material];ms.forEach(m=>{if(m.map && ![...signTextures.values()].includes(m.map))m.map.dispose();m.dispose();});
       }
     });
-    cityRoot=null;colliders=[];traffic=[];routeCache=null;
+    cityRoot=null;colliders=[];mapFootprintCache=[];traffic=[];routeCache=null;
   }
   function updateCity(dt){
     if(!cityRoot||!routeCache)return;
@@ -576,7 +581,23 @@ export function installCityFlight(api, editor, panel) {
       for(const wheel of item.wheels)wheel.rotation.x+=item.speed*dt/.43*item.direction;
     }
   }
-  function clearCity(){if(flight)closeFlight();stopCityPreview();disposeCity();cityConfig=null;setStatus('街区を削除しました。コース設計はそのまま残ります。');}
+  function clearCity(){if(flight)closeFlight();stopCityPreview();disposeCity();cityConfig=null;setStatus('街区を削除しました。コース設計はそのまま残ります。');if(editor&&typeof editor.draw==='function'&&editor.step===1)editor.draw();}
+  // Exact top-view building footprints, derived from the same colliders used by 3D placement.
+  // Returned objects are read-only to consumers; the map renderer only reads these fields.
+  function rebuildMapFootprintCache(){
+    mapFootprintCache=colliders.map(b=>{
+      const c=Math.cos(b.yaw||0),s=Math.sin(b.yaw||0);
+      return {
+        x:b.x+(b.cx||0)*c+(b.cz||0)*s,
+        z:b.z-(b.cx||0)*s+(b.cz||0)*c,
+        yaw:b.yaw||0,
+        halfW:b.halfW,
+        halfD:b.halfD,
+        height:Math.max(0,(b.maxY||0)-(b.minY||0))
+      };
+    });
+  }
+  function getBuildingFootprints(){return mapFootprintCache;}
   function inspectCityClearance(){
     if(!routeCache)return {buildings:0,violations:0,minClearance:null};
     const samples=routeSamples(routeCache.tr,6000);let violations=0,minClearance=Infinity;
@@ -1207,6 +1228,7 @@ export function installCityFlight(api, editor, panel) {
   previewExitUI=makePreviewExitUI();
   const updateTimer=setInterval(()=>{if(!flight)updateCity(.08);},80);
   const oldUpdateDestroy=destroy;
-  api.cityFlight={makeCity,clearCity,makeMountainTerrain,clearMountains,serialize,restore,inspectCityClearance,getMeshes:cityMeshes,createAircraft:buildAircraft,startFlight,closeFlight,destroy(){clearInterval(updateTimer);oldUpdateDestroy();panelStyle.remove();delete api.cityFlight;}};
+  editor.getCityBuildingFootprints=getBuildingFootprints;
+  api.cityFlight={makeCity,clearCity,makeMountainTerrain,clearMountains,serialize,restore,inspectCityClearance,getBuildingFootprints,getMeshes:cityMeshes,createAircraft:buildAircraft,startFlight,closeFlight,destroy(){clearInterval(updateTimer);oldUpdateDestroy();panelStyle.remove();if(editor.getCityBuildingFootprints===getBuildingFootprints)delete editor.getCityBuildingFootprints;delete api.cityFlight;}};
   return api.cityFlight;
 }

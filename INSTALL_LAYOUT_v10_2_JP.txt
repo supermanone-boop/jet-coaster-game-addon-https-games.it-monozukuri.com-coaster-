@@ -1,0 +1,16 @@
+GitHub main ブランチ直下の配置
+==============================
+
+main.js
+track.js
+editor.js
+world.js
+codec.js
+coaster_expansion.js
+coaster_architecture.js
+coaster_city_flight.js
+sim.js
+coaster_expansion_launcher_v10_2.js
+
+起動ブックマークレットはPC／スマホのブックマークURLに登録します。
+ゲームの /coaster/ ページで実行してください。
