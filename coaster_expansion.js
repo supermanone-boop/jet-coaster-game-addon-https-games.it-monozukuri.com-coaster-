@@ -1,6 +1,6 @@
 import { installArchitecturePack } from './coaster_architecture.js';
 import { installCityFlight } from './coaster_city_flight.js';
-/* Coaster Expansion v10.0
+/* Coaster Expansion v11.0
  * Loaded by the game's main.js. Adds tools inside the native editor UI.
  * GLB/glTF importer supports triangle meshes, PBR base color/metal/roughness,
  * transforms and base-color textures. Skins, morph targets and animation are not imported.
@@ -1407,7 +1407,7 @@ export function installCoasterExpansion(api, helpers) {
   mountNativeUI();
 
   api.expansion={
-    version:'10.2',models,architecture:architecturePack,cityFlight:cityFlightPack,
+    version:'11.0',models,architecture:architecturePack,cityFlight:cityFlightPack,
     exportGLB:async()=>{
       if(typeof api.createTrackExportGroup!=='function')throw new Error('GLB出力APIがありません');
       const built=api.createTrackExportGroup(editor.design);

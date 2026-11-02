@@ -1,4 +1,4 @@
-/* Coaster City Grid + Terrain + Flight Simulator v4.0
+/* Coaster City Grid + Terrain + Flight Simulator v11.0
  * Asphalt city ground, road traffic, close-but-clear buildings, and an original procedural jet.
  * Built for the Three.js runtime used by the original coaster game.
  */
@@ -498,6 +498,8 @@ export function installCityFlight(api, editor, panel) {
     const airport=addAirport(B,root,bounds,center);
     B.finish();
     rebuildMapFootprintCache();
+    ensureCityMapControls();
+    if(editor.step===1)fitCityMapView();
 
     // Build detailed cars once; each vehicle follows one straight, marked street lane.
     const carPaint=[0xb93f3b,0xe3e5e2,0x3f6f9a,0xd5a849,0x2d343a,0x597d69,0x7d7194];
@@ -598,6 +600,39 @@ export function installCityFlight(api, editor, panel) {
     });
   }
   function getBuildingFootprints(){return mapFootprintCache;}
+  function fitCityMapView(){
+    if(!editor||!editor.mapView)return false;
+    const buildings=getBuildingFootprints();
+    const xs=[],zs=[];
+    for(const b of buildings){
+      const c=Math.cos(b.yaw||0),sn=Math.sin(b.yaw||0);
+      for(const [lx,lz] of [[-b.halfW,-b.halfD],[b.halfW,-b.halfD],[b.halfW,b.halfD],[-b.halfW,b.halfD]]){
+        xs.push(b.x+lx*c+lz*sn);zs.push(b.z-lx*sn+lz*c);
+      }
+    }
+    const pts=editor.design&&Array.isArray(editor.design.pts)?editor.design.pts:[];
+    for(const p of pts){if(Number.isFinite(p[0])&&Number.isFinite(p[1])){xs.push(p[0]);zs.push(p[1]);}}
+    if(!xs.length||!zs.length)return false;
+    const minX=Math.min(...xs),maxX=Math.max(...xs),minZ=Math.min(...zs),maxZ=Math.max(...zs);
+    const spanX=Math.max(140,maxX-minX),spanZ=Math.max(96,maxZ-minZ);
+    const padX=Math.max(60,spanX*.055),padZ=Math.max(45,spanZ*.055);
+    const portrait=editor.H>editor.W*1.15;
+    const viewW=portrait?96:140,viewH=portrait?140:96;
+    editor.mapView={cx:(minX+maxX)/2,cz:(minZ+maxZ)/2,zoom:clamp(Math.min(viewW/(spanX+padX*2),viewH/(spanZ+padZ*2)),.002,8)};
+    const tools=editor.cvWrap&&editor.cvWrap.querySelector('.ed-exp-viewtools');
+    const label=tools&&tools.querySelector('[data-map-label]');
+    if(label)label.textContent=`${Math.round(editor.mapView.zoom*100)}%`;
+    if(typeof editor.draw==='function')editor.draw();
+    return {buildings:buildings.length,minX,maxX,minZ,maxZ,zoom:editor.mapView.zoom};
+  }
+  function ensureCityMapControls(){
+    const tools=editor&&editor.cvWrap&&editor.cvWrap.querySelector('.ed-exp-viewtools');
+    if(!tools||tools.querySelector('[data-map="city-fit"]'))return;
+    const button=document.createElement('button');button.type='button';button.dataset.map='city-fit';button.textContent='街全体';button.title='生成された全建物を実際の配置で表示';
+    button.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();fitCityMapView();});
+    const label=tools.querySelector('[data-map-label]');
+    if(label)tools.insertBefore(button,label);else tools.appendChild(button);
+  }
   function inspectCityClearance(){
     if(!routeCache)return {buildings:0,violations:0,minClearance:null};
     const samples=routeSamples(routeCache.tr,6000);let violations=0,minClearance=Infinity;
@@ -626,8 +661,12 @@ export function installCityFlight(api, editor, panel) {
     mountainRoot=null;mountainConfig=null;mountainClock=0;
   }
   function mountainSeedNoise(seed,a,b){
-    const v=Math.sin(a*12.9898+b*78.233+(seed>>>0)*0.000013)*43758.5453;
-    return (v-Math.floor(v))*2-1;
+    const hash=(x,z)=>{const v=Math.sin(x*127.1+z*311.7+(seed>>>0)*0.000013)*43758.5453;return (v-Math.floor(v))*2-1;};
+    const x=Math.floor(a),z=Math.floor(b),u=a-x,v=b-z;
+    const fade=t=>t*t*(3-2*t),fx=fade(u),fz=fade(v);
+    const a0=hash(x,z)+(hash(x+1,z)-hash(x,z))*fx;
+    const a1=hash(x,z+1)+(hash(x+1,z+1)-hash(x,z+1))*fx;
+    return a0+(a1-a0)*fz;
   }
   function mountainSmooth(t){t=clamp(t,0,1);return t*t*(3-2*t);}
   function mountainRiverCenter(s,half,seed,side){
@@ -635,7 +674,7 @@ export function installCityFlight(api, editor, panel) {
   }
   function mountainHeightAt(s,offset,side,routeY,half,peak,style,seed){
     const phase=s*.00115+(seed%997)*.017+side*.9;
-    const n1=Math.sin(phase*1.7+offset*.0018),n2=Math.sin(phase*3.2-offset*.0041),n3=mountainSeedNoise(seed,Math.floor(s/23),Math.floor(offset/17));
+    const n1=Math.sin(phase*1.7+offset*.0018),n2=Math.sin(phase*3.2-offset*.0041),n3=mountainSeedNoise(seed,s/23,offset/17);
     const river=mountainRiverCenter(s,half,seed,side);
     const riverWidth=Math.max(34,half*.035);
     const riverBlend=Math.exp(-Math.pow((offset-river)/riverWidth,2));
@@ -673,14 +712,16 @@ export function installCityFlight(api, editor, panel) {
       const mesa=mountainSmooth((offset-ridge1+sigma1*.9)/(sigma1*.35))*mountainSmooth((ridge1+sigma1*.9-offset)/(sigma1*.35));
       height=Math.max(height,ridgeA*.78*mesa+inner);
     }
-    return Math.max(0,height);
+    // 外周 88〜100% は標高 0m へ連続的に接続。山体の端が地面から浮いたり、垂直に切れたりしない。
+    const outerFade=1-mountainSmooth((offset-half*.88)/(half*.12));
+    return Math.max(0,height)*outerFade;
   }
   function buildRouteSpatial(samples,cell=20){
     const bins=new Map();
     for(const p of samples){const x=Math.floor(p.x/cell),z=Math.floor(p.z/cell),key=`${x},${z}`;let a=bins.get(key);if(!a)bins.set(key,a=[]);a.push(p);}
     return {bins,cell};
   }
-  function isNearRoute(spatial,x,z,minDistance=7.5){
+  function isNearRoute(spatial,x,z,minDistance=12){
     const c=spatial.cell,gx=Math.floor(x/c),gz=Math.floor(z/c),r=Math.ceil(minDistance/c)+1,d2=minDistance*minDistance;
     for(let ix=-r;ix<=r;ix++)for(let iz=-r;iz<=r;iz++){
       const bucket=spatial.bins.get(`${gx+ix},${gz+iz}`);if(!bucket)continue;
@@ -704,9 +745,9 @@ export function installCityFlight(api, editor, panel) {
       rugged:[0x3d4d48,0x777b76,0xc0c4bf],snow:[0x40515d,0x9daeb7,0xf0f5f7]
     };
     const cLow=new T.Color(palettes[style][0]),cMid=new T.Color(palettes[style][1]),cHigh=new T.Color(palettes[style][2]);
-    const material=new T.MeshStandardMaterial({vertexColors:true,roughness:style==='volcanic'?.96:.99,metalness:0,side:T.DoubleSide,flatShading:false});
+    const material=new T.MeshStandardMaterial({vertexColors:true,roughness:style==='volcanic'?.96:.99,metalness:0,side:T.FrontSide,flatShading:false});
     const waterMaterial=new T.MeshStandardMaterial({color:0x3988ad,roughness:.16,metalness:.16,transparent:true,opacity:.9,side:T.DoubleSide,emissive:0x082b3a,emissiveIntensity:.18});
-    const stations=clamp(Math.ceil(tr.L/18),150,520),lateralSegments=48;
+    const stations=clamp(Math.ceil(tr.L/14),200,720),lateralSegments=96;
     const geometries=[];
     const routeHigh=Math.max(0,...route.map(p=>p.y||0));
     const peakBase=Math.max(maxHeight,routeHigh+Math.min(420,maxHeight*.42));
@@ -721,16 +762,18 @@ export function installCityFlight(api, editor, panel) {
           let offset=8+(half-8)*Math.pow(t,1.52);
           let p=worldFromLocal(frame,side*offset,0);
           // Every terrain vertex is checked against the complete route, including crossings and tight turns.
-          for(let attempt=0;attempt<7&&isNearRoute(spatial,p.x,p.z,7.5);attempt++){
-            offset+=7.5;p=worldFromLocal(frame,side*offset,0);
+          for(let attempt=0;attempt<12&&isNearRoute(spatial,p.x,p.z,12);attempt++){
+            offset+=12;p=worldFromLocal(frame,side*offset,0);
           }
-          const y=heightAt(s,offset,side,routeY)-2;
+          const y=heightAt(s,offset,side,routeY);
           positions.push(p.x,y,p.z);
           let hNorm=clamp(y/Math.max(1,peakBase),0,1);
           let color=cLow.clone().lerp(cMid,clamp(hNorm*1.8,0,1));
           color.lerp(cHigh,clamp((hNorm-.52)*1.7,0,.92));
-          const rugged=mountainSeedNoise(seed+side*31,Math.floor(s/28),Math.floor(offset/21));
-          color.multiplyScalar(.94+((rugged+1)*.03));
+          const rugged=mountainSeedNoise(seed+side*31,s/28,offset/21);
+          // 高度帯を薄く入れ、陰影だけでは読みにくかった谷・尾根の起伏を視認しやすくする。
+          const contour=.5+.5*Math.cos(hNorm*Math.PI*2*18);
+          color.multiplyScalar((.94+((rugged+1)*.03))*(.94+contour*.06));
           if((style==='alpine'||style==='snow')&&hNorm>.78)color.lerp(new T.Color(0xf3f5f5),clamp((hNorm-.78)/.18,0,1));
           if(style==='volcanic'&&rugged>.68)color.lerp(new T.Color(0x3a2b27),.28);
           colors.push(color.r,color.g,color.b);
@@ -738,7 +781,9 @@ export function installCityFlight(api, editor, panel) {
       }
       for(let i=0;i<stations;i++)for(let j=0;j<lateralSegments;j++){
         const a=i*(lateralSegments+1)+j,b=a+lateralSegments+1;
-        indices.push(a,b,a+1,a+1,b,b+1);
+        // 左右の山体で三角形の winding を反転し、両側とも法線が上向きになるよう統一。
+        if(side>0) indices.push(a,b,a+1,a+1,b,b+1);
+        else indices.push(a,a+1,b,a+1,b+1,b);
       }
       const geo=new T.BufferGeometry();geo.setAttribute('position',new T.Float32BufferAttribute(positions,3));geo.setAttribute('color',new T.Float32BufferAttribute(colors,3));geo.setIndex(indices);geo.computeVertexNormals();geo.computeBoundingSphere();
       const mesh=new T.Mesh(geo,material);mesh.name=`MountainTerrain_${side>0?'Right':'Left'}_${style}`;mesh.frustumCulled=true;root.add(mesh);geometries.push(geo);
@@ -781,11 +826,11 @@ export function installCityFlight(api, editor, panel) {
     }
     if(!root.children.length){material.dispose();waterMaterial.dispose();throw new Error('山岳メッシュを生成できませんでした。');}
     scene.add(root);mountainRoot=root;mountainClock=0;
-    mountainConfig={enabled:true,style,height:maxHeight,areaWidth,seed,count:root.children.filter(o=>o.name.startsWith('MountainTerrain')).length,riverCount:2,routeClearance:7.5};
+    mountainConfig={enabled:true,style,height:maxHeight,areaWidth,seed,count:root.children.filter(o=>o.name.startsWith('MountainTerrain')).length,riverCount:2,routeClearance:12};
     const worldFar=Math.max(14000,areaWidth*2.8);
     if(scene.fog)scene.fog.far=Math.max(scene.fog.far||0,worldFar);
     if(api.camera.far<worldFar){api.camera.far=worldFar;api.camera.updateProjectionMatrix();}
-    setStatus(`山岳地形を生成：${style}／連続山体2面・河川2本・樹林帯。線路との最小平面離隔7.5mを検査しました。`);
+    setStatus(`山岳地形を生成：${style}／連続山体2面・河川2本・樹林帯。線路との最小平面離隔12mを検査しました。`);
     return mountainConfig;
   }
   function clearMountains(){disposeMountains();setStatus('山岳地形を削除しました。コースの高さと形はそのままです。');}
@@ -1229,6 +1274,8 @@ export function installCityFlight(api, editor, panel) {
   const updateTimer=setInterval(()=>{if(!flight)updateCity(.08);},80);
   const oldUpdateDestroy=destroy;
   editor.getCityBuildingFootprints=getBuildingFootprints;
-  api.cityFlight={makeCity,clearCity,makeMountainTerrain,clearMountains,serialize,restore,inspectCityClearance,getBuildingFootprints,getMeshes:cityMeshes,createAircraft:buildAircraft,startFlight,closeFlight,destroy(){clearInterval(updateTimer);oldUpdateDestroy();panelStyle.remove();if(editor.getCityBuildingFootprints===getBuildingFootprints)delete editor.getCityBuildingFootprints;delete api.cityFlight;}};
+  editor.fitCityMapView=fitCityMapView;
+  ensureCityMapControls();
+  api.cityFlight={makeCity,clearCity,makeMountainTerrain,clearMountains,serialize,restore,inspectCityClearance,getBuildingFootprints,fitCityMapView,getMeshes:cityMeshes,createAircraft:buildAircraft,startFlight,closeFlight,destroy(){clearInterval(updateTimer);oldUpdateDestroy();panelStyle.remove();if(editor.getCityBuildingFootprints===getBuildingFootprints)delete editor.getCityBuildingFootprints;if(editor.fitCityMapView===fitCityMapView)delete editor.fitCityMapView;delete api.cityFlight;}};
   return api.cityFlight;
 }
