@@ -1,6 +1,6 @@
 (async()=>{
 'use strict';
-const ROOT='https://raw.githubusercontent.com/supermanone-boop/jet-coaster-game-addon-https.games.it-monozukuri.com-coaster-/refs/heads/main/';
+const ROOT='https://raw.githubusercontent.com/supermanone-boop/jet-coaster-game-addon-https-games.it-monozukuri.com-coaster-/refs/heads/main/';
 const ADDON=['coaster_expansion.js','coaster_architecture.js','coaster_city_flight.js','coaster_codec_v3.js','coaster_freecam_patch_v11.js','coaster_v11_patch_track.js','coaster_v11_patch_world.js','coaster_v11_patch_sim.js','coaster_v11_patch_editor.js'];
 const KEY='__coasterExpansionLauncherV11';
 const show=(msg,bad=false)=>{let el=document.getElementById('coaster-expansion-launcher-message');if(!el){el=document.createElement('div');el.id='coaster-expansion-launcher-message';el.style.cssText='position:fixed;z-index:2147483647;left:10px;right:10px;top:10px;padding:12px 14px;border-radius:9px;background:#152238;color:#fff;font:14px/1.5 system-ui;box-shadow:0 3px 18px #0005;white-space:pre-wrap;overflow-wrap:anywhere';document.body.appendChild(el);}el.style.background=bad?'#8b2525':'#152238';el.textContent=msg;};
