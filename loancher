@@ -1,0 +1,316 @@
+(async () => {
+  'use strict';
+  const ROOT = 'https://raw.githubusercontent.com/supermanone-boop/jet-coaster-game-addon-https-games.it-monozukuri.com-coaster-/refs/heads/main/';
+  const EXT_FILES = ['coaster_expansion.js', 'coaster_architecture.js', 'coaster_city_flight.js'];
+  const GAME_FILES = ['main.js', 'track.js', 'editor.js', 'world.js', 'codec.js', 'sim.js'];
+  const KEY = '__coasterExpansionLauncherV111';
+
+  function show(message, error = false) {
+    let el = document.getElementById('coaster-expansion-launcher-message');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'coaster-expansion-launcher-message';
+      el.style.cssText = 'position:fixed;z-index:2147483647;left:10px;right:10px;top:10px;padding:12px 14px;border-radius:9px;background:#152238;color:#fff;font:14px/1.5 system-ui;box-shadow:0 3px 18px #0005;white-space:pre-wrap;overflow-wrap:anywhere';
+      document.body.appendChild(el);
+    }
+    el.style.background = error ? '#8b2525' : '#152238';
+    el.textContent = message;
+  }
+  const blob = code => URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+  function replaceOnce(source, before, after, label) {
+    const first = source.indexOf(before);
+    if (first < 0) throw new Error(`${label} の更新位置が見つかりません。ゲーム本体の構成が変わった可能性があります。`);
+    if (source.indexOf(before, first + before.length) >= 0) throw new Error(`${label} の更新位置が複数あります。安全のため起動を中止しました。`);
+    return source.slice(0, first) + after + source.slice(first + before.length);
+  }
+  function imports(code, paths) {
+    return code.replace(/(\bfrom\s*)(["'])([^"']+)\2/g, (all, prefix, quote, spec) =>
+      Object.prototype.hasOwnProperty.call(paths, spec) ? prefix + quote + paths[spec] + quote : all
+    );
+  }
+  function patchTrack(source) {
+    const re = /export const MATS = \[[\s\S]*?\];\r?\n\/\/ 安全バー[\s\S]*?export const BARS = \[[\s\S]*?\];/;
+    if (!re.test(source)) throw new Error('track.js の材質・安全バー定義が見つかりません。');
+    const block = `// 線路の素材。白金ダイヤモンドを基準に、その上の10段階は (段階+1)^2 倍で成長する。
+const PLATINUM_DIAMOND = { id: 'platinum-diamond', name: '白金ダイヤモンド', v: 14, l: 9, cascade: 1, cost: 120 };
+const PLATINUM_DIAMOND_UPGRADES = Array.from({ length: 10 }, (_, i) => {
+  const level = i + 1;
+  const multiplier = (level + 1) ** 2;
+  return {
+    id: 'platinum-diamond-' + level,
+    name: '白金ダイヤモンド＋' + level,
+    v: PLATINUM_DIAMOND.v * multiplier,
+    l: PLATINUM_DIAMOND.l * multiplier,
+    cascade: 1,
+    cost: Math.round(PLATINUM_DIAMOND.cost * multiplier),
+  };
+});
+export const MATS = [
+  { id: 'wood', name: '木製', v: 4.6, l: 2.6, cascade: 5, cost: 6 },
+  { id: 'steel', name: '鉄製', v: 6.5, l: 3.8, cascade: 3, cost: 10 },
+  { id: 'alloy', name: '超合金', v: 10, l: 6.5, cascade: 2, cost: 18 },
+  PLATINUM_DIAMOND,
+  ...PLATINUM_DIAMOND_UPGRADES,
+];
+// 安全装置。縄は従来のハーネスより高い耐荷重・保持率に設定する（シミュレーション上の値）。
+export const BARS = [
+  { id: 'belt', name: 'ベルトだけ', v: 0.7, l: 1.9, hold: 0.1, cost: 10 },
+  { id: 'bar', name: '安全バー', v: 1.6, l: 2.7, hold: 0.5, cost: 30 },
+  { id: 'harness', name: 'がっちりハーネス', v: 3.2, l: 4.5, hold: 0.85, cost: 70 },
+  { id: 'rope', name: '縄', v: 5.2, l: 6.3, hold: 0.98, cost: 130 },
+];`;
+    return source.replace(re, block);
+  }
+  function patchCodec(source) {
+    source = replaceOnce(source, 'const VER = 3;', 'const VER = 4;', 'codec.js の保存形式バージョン');
+    source = replaceOnce(
+      source,
+      'const out = [VER, (d.mat & 3) | ((d.bar & 3) << 2) | ((d.start & 3) << 4), d.cars & 7];',
+      'const out = [VER, (d.mat & 15) | ((d.bar & 3) << 4) | ((d.start & 3) << 6), d.cars & 7];',
+      'codec.js の材質番号保存'
+    );
+    source = replaceOnce(
+      source,
+      'if (version !== 1 && version !== 2 && version !== VER) return null;',
+      'if (version < 1 || version > VER) return null;',
+      'codec.js の旧共有URL互換'
+    );
+    source = replaceOnce(
+      source,
+      'const d = { mat: f & 3, bar: (f >> 2) & 3, start: (f >> 4) & 3, cars: rd(), gm: [], hs: [], pts: [] };',
+      'const modern = version >= 4;\n    const d = { mat: modern ? (f & 15) : (f & 3), bar: modern ? ((f >> 4) & 3) : ((f >> 2) & 3), start: modern ? ((f >> 6) & 3) : ((f >> 4) & 3), cars: rd(), gm: [], hs: [], pts: [] };',
+      'codec.js の材質番号読み込み'
+    );
+    return source;
+  }
+  function patchEditor(source) {
+    const matRe = /    row\('🛤 線路の強さ',[^\n]*\);/;
+    const barRe = /    row\('🦺 安全バー',[^\n]*\);/;
+    if (!matRe.test(source) || !barRe.test(source)) throw new Error('editor.js の材質・安全装置選択UIが見つかりません。');
+    const matUI = [
+      '    const selectedMat = MATS[d.mat] || MATS[1];',
+      '    const matLevel = Math.max(0, d.mat - 3);',
+      '    const matMultiplier = matLevel ? (matLevel + 1) ** 2 : 1;',
+      "    row('🛤 線路の強さ', MATS.map((m) => m.name), d.mat, (i) => (d.mat = i), selectedMat.name + '：上下 ' + selectedMat.v.toLocaleString('ja-JP') + 'G・横 ' + selectedMat.l.toLocaleString('ja-JP') + 'G／強度倍率 ' + matMultiplier);"
+    ].join('\n');
+    const barUI = [
+      '    const selectedBar = BARS[d.bar] || BARS[1];',
+      "    row('🦺 安全バー', BARS.map((b) => b.name), d.bar, (i) => (d.bar = i), selectedBar.name + '：上下 ' + selectedBar.v + 'G・横 ' + selectedBar.l + 'G・事故時保持率 ' + Math.round(selectedBar.hold * 100) + '%');"
+    ].join('\n');
+    source = source.replace(matRe, matUI).replace(barRe, barUI);
+    return source;
+  }
+  function patchMain(source, urls, jsBase) {
+    source = replaceOnce(
+      source,
+      'BUDGET, H_SAMPLES, defaultHeights',
+      'BUDGET, H_SAMPLES, MAX_LEN, polyLen, defaultHeights',
+      'main.js の拡張ヘルパー import'
+    );
+    source = replaceOnce(
+      source,
+      "import { watchUpdate } from '../../common/update-check.js';",
+      `import { watchUpdate } from '../../common/update-check.js';\nimport { installCoasterExpansion } from '${urls.expansion}';`,
+      'main.js の拡張モジュール import'
+    );
+    source = replaceOnce(
+      source,
+      'new URL(f, import.meta.url)',
+      `new URL(f, '${jsBase}')`,
+      'main.js のフォント取得URL'
+    );
+    source = replaceOnce(
+      source,
+      'function tick(dt, render = true) {\n  modeT += dt;',
+      `let extensionFrameHook = null;
+function tick(dt, render = true) {
+  if (extensionFrameHook) {
+    try { extensionFrameHook(dt); }
+    catch (error) { console.error('[Coaster Expansion frame hook]', error); extensionFrameHook = null; }
+    if (extensionFrameHook) {
+      if (render) renderer.render(scene3d, camera);
+      return;
+    }
+  }
+  modeT += dt;`,
+      'main.js の拡張フレームフック'
+    );
+    const bootMarker = '  requestAnimationFrame(frame);\n}\nboot();';
+    if (!source.includes(bootMarker)) throw new Error('main.js の起動位置が一致しません。');
+    source = source.replace(bootMarker, '  requestAnimationFrame(frame);\n  window.__coasterExpansionBooted = true;\n}\nwindow.__coasterExpansionFrame = frame;\nboot();');
+    source += `
+// Coaster Expansion runtime bridge (adapted for the current game main.js)
+const coasterExpansionRuntime = {
+  get editor() { return editor; },
+  get co() { return co; },
+  get scene3d() { return scene3d; },
+  get camera() { return camera; },
+  get renderer() { return renderer; },
+  get THREE() { return THREE; },
+  get mode() { return mode; },
+  get sim() { return co ? co.sim : null; },
+  get cameraMode() { return cam.mode; },
+  get paused() { return !!player.paused; },
+  get playbackSpeed() { return speed; },
+  setFrameHook(fn) {
+    if (fn != null && typeof fn !== 'function') throw new TypeError('フレームフックは関数またはnullを指定してください');
+    extensionFrameHook = fn || null;
+    return !!extensionFrameHook;
+  },
+  clearFrameHook() { extensionFrameHook = null; },
+  setCameraMode(name) {
+    if (!CAM_MODES.includes(name)) throw new Error('未対応のカメラモードです');
+    cam.mode = name;
+    ui.camBtn.textContent = '🎥 ' + CAM_NAMES[name];
+    cam.shotT = 0;
+    return cam.mode;
+  },
+  setPlaybackSpeed(value) {
+    const v = Number(value);
+    if (!SPEEDS.includes(v)) throw new Error('再生速度は0.5 / 1 / 2 / 4倍から選んでください');
+    setSpeed(v);
+    return speed;
+  },
+  setPaused(value) {
+    if (mode !== 'ride') return false;
+    if (co && co.sim.mode === 'done' && !value) player.pending = 0;
+    player.paused = !!value;
+    refreshPlay();
+    return player.paused;
+  },
+  togglePlayback() {
+    if (mode !== 'ride') return false;
+    togglePlay();
+    return player.paused;
+  },
+  normalize,
+  buildTrack,
+  prepare,
+  Sim,
+  createTrackExportGroup(design = editor.design) {
+    if (!design || !Array.isArray(design.pts) || design.pts.length < 2) throw new Error('書き出すコースがありません');
+    const tr = prepare(design, buildTrack);
+    const look = cleanLook(design.look);
+    const built = buildTrackMeshes(tr, look.rail, false, look.tunnel);
+    built.group.name = 'EditedCoasterTrack';
+    return { group: built.group, track: tr };
+  },
+};
+window.__coasterExpansionRuntime = coasterExpansionRuntime;
+installCoasterExpansion(coasterExpansionRuntime, { FIELD, MAX_LEN, randomStroke, polyLen, autoHeights, H_SAMPLES, STARTS });
+`;
+    return source;
+  }
+
+  try {
+    if (!location.hostname.endsWith('it-monozukuri.com') || !location.pathname.startsWith('/coaster/')) {
+      throw new Error('「ジェットコースターを作ろう！」の /coaster/ ページで実行してください。');
+    }
+    if (window[KEY]) throw new Error('すでにv11.1が起動しています。再読み込みしてから実行してください。');
+
+    show('ゲーム本体と拡張モジュールを取得しています…');
+    const jsBase = new URL('js/', location.href).href;
+    const gameFile = name => new URL(name, jsBase).href;
+    const threeURL = new URL('../../crowded-train-3d/js/vendor/three.module.min.js', jsBase).href;
+    const analyticsURL = new URL('../../common/analytics.js', jsBase).href;
+    const updateCheckURL = new URL('../../common/update-check.js', jsBase).href;
+
+    const [gameEntries, extensionEntries] = await Promise.all([
+      Promise.all(GAME_FILES.map(async name => {
+        const r = await fetch(gameFile(name), { cache: 'no-store' });
+        if (!r.ok) throw new Error(`ゲーム本体 ${name} の取得に失敗しました（HTTP ${r.status}）。`);
+        return [name, await r.text()];
+      })),
+      Promise.all(EXT_FILES.map(async name => {
+        const r = await fetch(ROOT + name, { cache: 'no-store' });
+        if (!r.ok) throw new Error(`拡張 ${name} の取得に失敗しました（HTTP ${r.status}）。`);
+        return [name, await r.text()];
+      })),
+    ]);
+    const src = Object.fromEntries([...gameEntries, ...extensionEntries]);
+
+    src['track.js'] = patchTrack(src['track.js']);
+    src['codec.js'] = patchCodec(src['codec.js']);
+    src['editor.js'] = patchEditor(src['editor.js']);
+
+    const urls = {};
+    urls.track = blob(src['track.js']);
+    urls.codec = blob(imports(src['codec.js'], {
+      './track.js': urls.track,
+      './looks.js': gameFile('looks.js'),
+    }));
+    urls.sim = blob(imports(src['sim.js'], {
+      './track.js': urls.track,
+      './codec.js': urls.codec,
+    }));
+    urls.world = blob(imports(src['world.js'], {
+      '../../crowded-train-3d/js/vendor/three.module.min.js': threeURL,
+      './track.js': urls.track,
+      './sim.js': urls.sim,
+      './themes.js': gameFile('themes.js'),
+      './looks.js': gameFile('looks.js'),
+    }));
+    urls.editor = blob(imports(src['editor.js'], {
+      './track.js': urls.track,
+      './sim.js': urls.sim,
+      './fix.js': gameFile('fix.js'),
+      './themes.js': gameFile('themes.js'),
+      './audio.js': gameFile('audio.js'),
+      './looks.js': gameFile('looks.js'),
+    }));
+    urls.architecture = blob(src['coaster_architecture.js']);
+    urls.cityFlight = blob(src['coaster_city_flight.js']);
+    urls.expansion = blob(imports(src['coaster_expansion.js'], {
+      './coaster_architecture.js': urls.architecture,
+      './coaster_city_flight.js': urls.cityFlight,
+    }));
+
+    let mainSource = patchMain(src['main.js'], urls, jsBase);
+    urls.main = blob(imports(mainSource, {
+      '../../crowded-train-3d/js/vendor/three.module.min.js': threeURL,
+      './audio.js': gameFile('audio.js'),
+      '../../common/analytics.js': analyticsURL,
+      './track.js': urls.track,
+      './sim.js': urls.sim,
+      './world.js': urls.world,
+      './looks.js': gameFile('looks.js'),
+      './editor.js': urls.editor,
+      './codec.js': urls.codec,
+      './fix.js': gameFile('fix.js'),
+      './favs.js': gameFile('favs.js'),
+      './news.js': gameFile('news.js'),
+      '../../common/update-check.js': updateCheckURL,
+    }));
+
+    const nativeRAF = window.requestAnimationFrame.bind(window);
+    window.__coasterExpansionFrame = null;
+    window.__coasterExpansionBooted = false;
+    window.requestAnimationFrame = function (callback, ...args) {
+      if (typeof callback === 'function' && callback.name === 'frame' && callback !== window.__coasterExpansionFrame) return 0;
+      return nativeRAF(callback, ...args);
+    };
+
+    const body = document.body;
+    body.replaceWith(body.cloneNode(true));
+    show('更新後のゲーム本体と拡張機能を起動しています…');
+    await import(urls.main);
+
+    await new Promise((resolve, reject) => {
+      const startedAt = Date.now();
+      const check = () => {
+        if (window.__coasterExpansionBooted && document.getElementById('rc-course-mode-buttons')) return resolve();
+        if (Date.now() - startedAt > 20000) return reject(new Error('起動確認に失敗しました。ページを再読み込みしてから再実行してください。'));
+        setTimeout(check, 100);
+      };
+      check();
+    });
+
+    window[KEY] = { urls, version: '11.1' };
+    const el = document.getElementById('coaster-expansion-launcher-message');
+    if (el) el.remove();
+    console.info('[Coaster Expansion] v11.1 起動完了：現行main.js接続／白金ダイヤモンド＋10段階／縄／都市・山岳・フライト拡張');
+  } catch (error) {
+    console.error('[Coaster Expansion Launcher v11.1]', error);
+    show(`起動エラー：${error.message || error}\n\nページを再読み込みすると元のゲームに戻ります。`, true);
+  }
+})();
