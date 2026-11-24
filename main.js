@@ -5,15 +5,16 @@
 import * as THREE from '../../crowded-train-3d/js/vendor/three.module.min.js';
 import { sound } from './audio.js';
 import { track as trackRaw } from '../../common/analytics.js';
-import { buildTrack, STATION, FIELD, DS, F, MATS, BARS, STARTS, BUDGET, H_SAMPLES, MAX_LEN, polyLen, defaultHeights, autoHeights, costOf, MAPS, mapOf } from './track.js';
+import { buildTrack, STATION, FIELD, DS, F, MATS, BARS, STARTS, BUDGET, H_SAMPLES, defaultHeights, autoHeights, costOf, MAPS, mapOf, rng } from './track.js';
 import { Sim, DT, prepare, frameQuat, riderSeat } from './sim.js';
 import { buildPark, buildStation, buildStationLights, buildTrackMeshes, makeCar, makeRider, Crowd, Particles, makeStarSprite, syncChunks, SCENES, Snowfall, buildTheme } from './world.js';
-import { RAIL_LOOKS, CAR_LOOKS, RIDER_LOOKS, SCENE_LOOKS, defaultLook, cleanLook, isDefaultLook } from './looks.js';
+import { RAIL_LOOKS, CAR_LOOKS, RIDER_LOOKS, SCENE_LOOKS, TUNNEL_LOOKS, defaultLook, cleanLook, isDefaultLook } from './looks.js';
 import { Editor, randomStroke, yen } from './editor.js';
-import { encode, decode, normalize, cleanMap } from './codec.js';
+import { encode, decode, normalize, cleanMap, ptsKey } from './codec.js';
 import { curveRadius } from './fix.js';
-import { installCoasterExpansion } from './coaster_expansion.js';
 import { loadFavs, saveFavs, newFavId, nextFavName, cleanName, MAX_FAVS } from './favs.js';
+import { News } from './news.js';
+import { watchUpdate } from '../../common/update-check.js';
 
 const QS = new URLSearchParams(location.search);
 const HOST = location.hostname;
@@ -23,7 +24,7 @@ const GAME_URL = location.origin + location.pathname.replace(/index\.html$/, '')
 const HASHTAG = 'ジェットコースターを作ろう';
 const SAVE_KEY = 'rc_design';
 // ゲームのバージョン（タイトル画面の右下に出す）。public/coaster/ のソースを変えるコミットごとに末尾（パッチ）を 1 つ上げる
-const VERSION = '1.2.0 + 拡張10.0';
+const VERSION = '1.4.0';
 const verEl = document.getElementById('ver');
 if (verEl) verEl.textContent = `ver ${VERSION}`;
 
@@ -42,7 +43,7 @@ const renderer = new THREE.WebGLRenderer({ canvas: cvs, antialias: true });
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.1;
-const camera = new THREE.PerspectiveCamera(55, 1, 0.3, 2400);
+const camera = new THREE.PerspectiveCamera(55, 1, 0.3, 700);
 const scene3d = new THREE.Scene();
 scene3d.background = new THREE.Color('#9fd0f5');
 scene3d.fog = new THREE.Fog('#cfe6f7', 140, 330);
@@ -101,12 +102,14 @@ function applyScene(id, map = 0) {
   scene3d.background.set(S.bg);
   scene3d.fog.color.set(S.fog[0]);
   scene3d.fog.near = S.fog[1];
-  scene3d.fog.far = Math.max(S.fog[2], 1800);
+  scene3d.fog.far = S.fog[2];
   hemi.color.set(S.hemi[0]);
   hemi.groundColor.set(S.hemi[1]);
   hemi.intensity = S.hemi[2];
+  hemi.userData.base = S.hemi[2];
   sun.color.set(S.sun[0]);
   sun.intensity = S.sun[1];
+  sun.userData.base = S.sun[1];
   sun.position.set(...S.sun[2]);
   renderer.toneMappingExposure = S.exposure;
   // 雪・花びら（景色が変わるたびに作り直す）
@@ -134,6 +137,9 @@ const crowd = new Crowd(130);
 scene3d.add(crowd.group);
 const fx = new Particles(500);
 scene3d.add(fx.points);
+// 水しぶき・水のカーテン専用の、大きな粒（1.3.0）
+const water = new Particles(1400, 1.2, true);
+scene3d.add(water.points);
 const starMat = makeStarSprite();
 const stars = [];
 
@@ -150,6 +156,21 @@ function disposeCoaster() {
   stars.length = 0;
   co = null;
 }
+// 区間（トンネル・水しぶき）の始まりと終わりの点の番号
+function runsOf(tr, flag) {
+  const out = [];
+  let a = -1;
+  for (let i = 0; i < tr.n; i++) {
+    if (tr.fl[i] & flag) {
+      if (a < 0) a = i;
+    } else if (a >= 0) {
+      out.push({ a, b: i - 1 });
+      a = -1;
+    }
+  }
+  if (a >= 0) out.push({ a, b: tr.n - 1 });
+  return out;
+}
 function setupCoaster(design, tr = null) {
   disposeCoaster();
   tr = tr || prepare(design, buildTrack);
@@ -165,7 +186,7 @@ function setupCoaster(design, tr = null) {
   }
   theme = buildTheme(sceneId, mapId, tr);
   if (theme) scene3d.add(theme.group);
-  const { group, meshes, bulbs } = buildTrackMeshes(tr, look.rail, !!SCENES[sceneId].lights);
+  const { group, meshes, bulbs } = buildTrackMeshes(tr, look.rail, !!SCENES[sceneId].lights, look.tunnel);
   const cars = [];
   const riders = [];
   const kind = RIDER_LOOKS[look.rider].id;
@@ -181,7 +202,8 @@ function setupCoaster(design, tr = null) {
     }
   }
   scene3d.add(group);
-  co = { design, tr, meshes, bulbs, group, cars, riders, sim: new Sim(tr, design) };
+  co = { design, tr, meshes, bulbs, group, cars, riders, sim: new Sim(tr, design), tunnels: runsOf(tr, F.TUNNEL), splashes: runsOf(tr, F.SPLASH) };
+
   crowd.place(tr, 3, mapId, theme ? theme.avoid : []);
   syncCoaster(0);
   return co;
@@ -281,8 +303,8 @@ const cam = {
   mode: 'auto', shot: 'chase', shotT: 0, follow: null, followT: 0, orbit: 0, fixed: null,
   povBody: null, povDir: new THREE.Vector3(1, 0, 0), // 先頭車の視点：最初に飛んでいったお客さんの目線に切り替える
 };
-const CAM_MODES = ['auto', 'chase', 'pov', 'free'];
-const CAM_NAMES = { auto: '中継', chase: '追いかけ', pov: '先頭車', free: '自由' };
+const CAM_MODES = ['auto', 'chase', 'pov'];
+const CAM_NAMES = { auto: '中継', chase: '追いかけ', pov: '先頭車' };
 const v1 = new THREE.Vector3();
 const v2 = new THREE.Vector3();
 function trackCenter() {
@@ -315,12 +337,6 @@ function setCam(px, py, pz, lx, ly, lz, k, dt, ux = 0, uy = 1, uz = 0) {
     cam.up.z = damp(cam.up.z, uz, 6, dt);
   }
   if (cam.pos.y < 1.2) cam.pos.y = 1.2;
-  const wantedFar = Math.max(2400, Math.abs(cam.pos.y) * 3 + 2400, co ? co.tr.maxH * 4 + 2400 : 2400);
-  if (wantedFar > camera.far) {
-    camera.far = wantedFar;
-    camera.updateProjectionMatrix();
-    if (scene3d.fog) scene3d.fog.far = Math.max(scene3d.fog.far, wantedFar * 0.75);
-  }
   camera.position.copy(cam.pos);
   camera.up.copy(cam.up).normalize();
   camera.lookAt(cam.look);
@@ -383,7 +399,6 @@ function povCamera(dt, lead) {
 function rideCamera(dt) {
   const sim = co.sim;
   const lead = sim.cars[0];
-  if (cam.mode === 'free') { updateFreeCamera(dt); return; }
   const f = lead.f;
   const p = lead.body ? lead.body.p : lead.p;
   let mode = cam.mode;
@@ -414,6 +429,20 @@ function rideCamera(dt) {
     const pz = f.z + f.uz * 1.75 + f.tz * 0.3;
     setCam(px, py, pz, px + f.tx * 10 + f.ux * -0.6, py + f.ty * 10 + f.uy * -0.6, pz + f.tz * 10 + f.uz * -0.6, 999, dt, f.ux, f.uy, f.uz);
     return;
+  }
+  // 中継：トンネルの中・出口の手前では、出口に置いたカメラから、列車が飛び出してくるのを見る
+  if (mode === 'auto' && sim.mode === 'track') {
+    const tn = co.tunnels.find((r) => f.i >= r.a - 10 && f.i <= r.b + 6);
+    if (tn) {
+      const e = co.tr.wrap(tn.b + 14);
+      const tr = co.tr;
+      const hx3 = Math.hypot(tr.tx[e], tr.tz[e]) || 1;
+      setCam(tr.px[e] + (tr.tx[e] / hx3) * 6 + (-tr.tz[e] / hx3) * 3, tr.py[e] + 2.2, tr.pz[e] + (tr.tz[e] / hx3) * 6 + (tr.tx[e] / hx3) * 3, p[0], p[1] + 1, p[2], 999, dt);
+      cam.shotT = Math.min(cam.shotT, 0.8);
+      // 外から写しているので、先頭車の目線のカットの扱い（水の膜・ぼかし）にしない
+      if (cam.shot === 'pov') cam.shot = 'chase';
+      return;
+    }
   }
   if (mode === 'auto') {
     // 中継：数秒ごとにカットを切り替える
@@ -472,6 +501,12 @@ let lastScream = -10;
 let lastCreak = -10;
 let ejectCount = 0;
 let ejectShownT = -10;
+// その出来事の垂直落下が、垂直を越えて落ちる形か（何番目の落下かを見る）
+function dropBeyond(e) {
+  const drops = co.tr.gms.filter((g) => g.t === 'drop');
+  const g = drops[e.data && e.data.n != null ? e.data.n : 0];
+  return !!(g && g.beyond);
+}
 function handleEvents(sim, now) {
   const evs = sim.events;
   while (sim.evI < evs.length) {
@@ -485,7 +520,7 @@ function handleEvents(sim, now) {
         hype += 0.3;
         break;
       case 'invert':
-        popup('宙返り！', '#ffd84a', 34);
+        popup(e.data && e.data.roll ? 'ひねり！' : '宙返り！', '#ffd84a', 34);
         sound.sfx('yahoo');
         sound.sfx('cheer', 0.7);
         hype += 0.5;
@@ -573,6 +608,45 @@ function handleEvents(sim, now) {
           fx.burst(e.x, 0.3, e.z, 5, '#c8b090', 2, 1, 0.6, 2);
         }
         break;
+      // 水しぶき・トンネル・垂直落下（1.3.0）
+      case 'spray': {
+        // 低い所は水に突っ込む。高い所は水のカーテンをくぐる
+        const low = !e.data || e.data.low !== false;
+        const fast = low && e.data && e.data.v > 18;
+        popup(!low ? '水のカーテン！' : fast ? 'ザッパーーン！！' : 'ザッパーン！', '#7fd8ff', fast ? 40 : 34);
+        sound.sfx(low ? 'bigsplash' : 'splash');
+        if (low) {
+          bigSplash(sim, e.data.v);
+          shakeT = 0.6;
+          sound.sfx('scream');
+          sound.sfx('cheer', 1.2);
+        } else fx.burst(e.x, e.y + 1, e.z, 45, '#bfe8ff', 6, 4, 1.3, 9.8);
+        hype += 0.4;
+        break;
+      }
+      case 'tunnel':
+        popup('トンネル！', '#ffd8a0', 26);
+        sound.sfx('tunnel');
+        sound.sfx('scream');
+        break;
+      case 'hold':
+        popup('落ちる直前で 一時停止…', '#ffffff', 24);
+        sound.sfx('gasp');
+        break;
+      case 'release':
+        // 垂直を越えて落ちる形（高い所に置いたとき）は、それと分かる言葉に
+        popup(dropBeyond(e) ? '90度超えの垂直落下！！' : '垂直落下！！', '#ff9a4a', 36);
+        sound.sfx('scream');
+        hype += 0.6;
+        break;
+      case 'drop':
+        // 勢いよく来て、てっぺんで止まらずに落ちたとき
+        if (e.data && !e.data.held) {
+          popup(dropBeyond(e) ? '90度超えの垂直落下！！' : '垂直落下！！', '#ff9a4a', 36);
+          sound.sfx('scream');
+          hype += 0.6;
+        }
+        break;
       case 'splash': {
         const sp = mapOf(mapId).splash;
         popup(sp.word, sp.color, 30);
@@ -638,168 +712,6 @@ const ui = {
   mute: document.getElementById('btn-mute'),
   editor: document.getElementById('editor'),
 };
-
-// 走行画面専用の自由カメラ。ドラッグで見回し、ボタンを押している間カメラを移動する。
-const freeCamState = {
-  pos: new THREE.Vector3(), yaw: 0, pitch: 0, speed: 40,
-  move: { forward: false, back: false, left: false, right: false, up: false, down: false },
-  drag: null,
-};
-const freeCamStyle = document.createElement('style');
-freeCamStyle.textContent = `
-#rc-free-camera{position:fixed;right:10px;bottom:max(84px,env(safe-area-inset-bottom));z-index:2147483645;width:min(264px,calc(100vw - 20px));box-sizing:border-box;padding:10px;border:1px solid #64748b;border-radius:12px;background:rgba(15,23,42,.94);color:#fff;box-shadow:0 5px 24px #0007;font:12px/1.35 system-ui,sans-serif;touch-action:manipulation}
-#rc-free-camera[hidden]{display:none!important}
-#rc-free-camera button{min-height:34px;border:1px solid #94a3b8;border-radius:7px;background:#f8fafc;color:#172033;font:700 12px system-ui,sans-serif;padding:5px 8px;touch-action:none}
-#rc-free-camera .rc-fc-top{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:7px}
-#rc-free-camera .rc-fc-look{height:52px;display:grid;place-items:center;margin-bottom:7px;border:1px dashed #94a3b8;border-radius:8px;background:rgba(148,163,184,.18);color:#fff;text-align:center;user-select:none;-webkit-user-select:none;touch-action:none}
-#rc-free-camera .rc-fc-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px}
-#rc-free-camera .rc-fc-grid button{width:100%}
-#rc-free-camera .rc-fc-speed{display:flex;align-items:center;gap:8px;margin-top:8px}
-#rc-free-camera input{width:100%;min-width:0}
-#rc-free-camera .rc-fc-speed output{min-width:54px;text-align:right;font-variant-numeric:tabular-nums}
-#rc-free-camera .rc-fc-help{margin:7px 0 0;color:#cbd5e1;font-size:11px}
-`;
-document.head.appendChild(freeCamStyle);
-const freeCamPanel = document.createElement('section');
-freeCamPanel.id = 'rc-free-camera';
-freeCamPanel.hidden = true;
-freeCamPanel.innerHTML = `
-<div class="rc-fc-top"><b>自由カメラ</b><button type="button" data-fc-action="auto">自動カメラへ戻る</button></div>
-<div class="rc-fc-look" data-fc-look>ここをドラッグして見回す</div>
-<div class="rc-fc-grid">
-  <button type="button" data-fc-move="forward">前進 ↑</button>
-  <button type="button" data-fc-move="up">上昇 +</button>
-  <button type="button" data-fc-move="back">後退 ↓</button>
-  <button type="button" data-fc-move="left">左 ←</button>
-  <button type="button" data-fc-action="reset">車両付近へ</button>
-  <button type="button" data-fc-move="right">右 →</button>
-  <button type="button" data-fc-move="down">下降 −</button>
-</div>
-<label class="rc-fc-speed">移動速度 <input type="range" min="1" max="250" value="40" data-fc-speed><output data-fc-speed-label>40 m/s</output></label>
-<p class="rc-fc-help">3D画面をドラッグして見回し、ボタンを押している間移動します。</p>`;
-document.body.appendChild(freeCamPanel);
-
-function clearFreeCamMoves() {
-  for (const key of Object.keys(freeCamState.move)) freeCamState.move[key] = false;
-}
-function activateFreeCamera() {
-  const dir = cam.look.clone().sub(cam.pos).normalize();
-  if (dir.lengthSq() < 0.0001) dir.set(1, 0, 0);
-  freeCamState.pos.copy(cam.pos);
-  freeCamState.yaw = Math.atan2(dir.z, dir.x);
-  freeCamState.pitch = Math.asin(clamp(dir.y, -0.98, 0.98));
-  freeCamState.drag = null;
-  clearFreeCamMoves();
-  freeCamPanel.hidden = mode !== 'ride';
-}
-function updateFreeCamera(dt) {
-  const step = Math.min(0.1, Math.max(0, dt)) * freeCamState.speed;
-  const yaw = freeCamState.yaw;
-  const forwardX = Math.cos(yaw), forwardZ = Math.sin(yaw);
-  const rightX = -Math.sin(yaw), rightZ = Math.cos(yaw);
-  const m = freeCamState.move;
-  const forward = Number(m.forward) - Number(m.back);
-  const sideways = Number(m.right) - Number(m.left);
-  const vertical = Number(m.up) - Number(m.down);
-  freeCamState.pos.x += (forwardX * forward + rightX * sideways) * step;
-  freeCamState.pos.z += (forwardZ * forward + rightZ * sideways) * step;
-  freeCamState.pos.y += vertical * step;
-  const cp = Math.cos(freeCamState.pitch);
-  const dir = new THREE.Vector3(cp * Math.cos(yaw), Math.sin(freeCamState.pitch), cp * Math.sin(yaw));
-  cam.pos.copy(freeCamState.pos);
-  cam.look.copy(freeCamState.pos).addScaledVector(dir, 100);
-  camera.position.copy(cam.pos);
-  camera.up.set(0, 1, 0);
-  camera.lookAt(cam.look);
-  const wantedFar = Math.max(2400, Math.abs(cam.pos.y) * 3 + 2400, co ? co.tr.maxH * 4 + 2400 : 2400);
-  if (wantedFar > camera.far) {
-    camera.far = wantedFar;
-    camera.updateProjectionMatrix();
-    if (scene3d.fog) scene3d.fog.far = Math.max(scene3d.fog.far, wantedFar * 0.75);
-  }
-}
-freeCamPanel.querySelectorAll('[data-fc-move]').forEach((button) => {
-  const key = button.dataset.fcMove;
-  button.addEventListener('pointerdown', (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    freeCamState.move[key] = true;
-    try { button.setPointerCapture(event.pointerId); } catch (_) {}
-  });
-  for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
-    button.addEventListener(type, (event) => {
-      event.stopPropagation();
-      freeCamState.move[key] = false;
-    });
-  }
-});
-document.addEventListener('pointerup', clearFreeCamMoves);
-document.addEventListener('pointercancel', clearFreeCamMoves);
-const freeCamLook = freeCamPanel.querySelector('[data-fc-look]');
-freeCamLook.addEventListener('pointerdown', (event) => {
-  event.preventDefault();
-  freeCamState.drag = { id: event.pointerId, x: event.clientX, y: event.clientY };
-  try { freeCamLook.setPointerCapture(event.pointerId); } catch (_) {}
-});
-freeCamLook.addEventListener('pointermove', (event) => {
-  const drag = freeCamState.drag;
-  if (!drag || drag.id !== event.pointerId) return;
-  const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
-  drag.x = event.clientX;
-  drag.y = event.clientY;
-  freeCamState.yaw -= dx * 0.006;
-  freeCamState.pitch = clamp(freeCamState.pitch - dy * 0.006, -1.48, 1.48);
-});
-for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
-  freeCamLook.addEventListener(type, () => { freeCamState.drag = null; });
-}
-// 自由カメラ中は3D画面そのものをドラッグして見回せる。
-cvs.addEventListener('pointerdown', (event) => {
-  if (mode !== 'ride' || cam.mode !== 'free') return;
-  event.preventDefault();
-  freeCamState.drag = { id: event.pointerId, x: event.clientX, y: event.clientY };
-  try { cvs.setPointerCapture(event.pointerId); } catch (_) {}
-});
-cvs.addEventListener('pointermove', (event) => {
-  const drag = freeCamState.drag;
-  if (mode !== 'ride' || cam.mode !== 'free' || !drag || drag.id !== event.pointerId) return;
-  const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
-  drag.x = event.clientX;
-  drag.y = event.clientY;
-  freeCamState.yaw -= dx * 0.006;
-  freeCamState.pitch = clamp(freeCamState.pitch - dy * 0.006, -1.48, 1.48);
-});
-for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
-  cvs.addEventListener(type, () => { freeCamState.drag = null; });
-}
-const freeCamSpeed = freeCamPanel.querySelector('[data-fc-speed]');
-const freeCamSpeedLabel = freeCamPanel.querySelector('[data-fc-speed-label]');
-freeCamSpeed.addEventListener('input', () => {
-  freeCamState.speed = Number(freeCamSpeed.value);
-  freeCamSpeedLabel.textContent = `${freeCamState.speed} m/s`;
-});
-freeCamPanel.querySelector('[data-fc-action="auto"]').addEventListener('click', () => {
-  cam.mode = 'auto';
-  cam.shotT = 0;
-  freeCamPanel.hidden = true;
-  ui.camBtn.textContent = `🎥 ${CAM_NAMES[cam.mode]}`;
-  clearFreeCamMoves();
-  sound.sfx('tap');
-});
-freeCamPanel.querySelector('[data-fc-action="reset"]').addEventListener('click', () => {
-  const f = co && co.sim && co.sim.cars[0] && co.sim.cars[0].f;
-  if (!f) return;
-  freeCamState.pos.set(f.x - f.tx * 24 + f.rx * 10, f.y + 12, f.z - f.tz * 24 + f.rz * 10);
-  const dir = new THREE.Vector3(
-    f.x - freeCamState.pos.x,
-    f.y + 2 - freeCamState.pos.y,
-    f.z - freeCamState.pos.z
-  ).normalize();
-  freeCamState.yaw = Math.atan2(dir.z, dir.x);
-  freeCamState.pitch = Math.asin(clamp(dir.y, -0.98, 0.98));
-  sound.sfx('tap');
-});
-
 function setMode(m) {
   mode = m;
   modeT = 0;
@@ -808,8 +720,6 @@ function setMode(m) {
   ui.result.hidden = m !== 'result';
   ui.intro.hidden = m !== 'intro';
   ui.favs.hidden = m !== 'favs';
-  freeCamPanel.hidden = !(m === 'ride' && cam.mode === 'free');
-  if (m !== 'ride') clearFreeCamMoves();
   if (m !== 'edit') editor.close();
   document.body.dataset.mode = m;
   // HUD を使わない場面では隠し、切り替えのたびに描き直す（全体を消しただけだと、前の絵が画面に残ることがあった）
@@ -838,7 +748,8 @@ function saveDesign(d) {
 // 装飾の分析用の短い名前（例：red-mix-cat-night）
 function lookId(l) {
   const k = cleanLook(l);
-  return `${RAIL_LOOKS[k.rail].id}-${CAR_LOOKS[k.car].id}-${RIDER_LOOKS[k.rider].id}-${SCENE_LOOKS[k.scene].id}`;
+  // トンネルの見た目は、選んだときだけ後ろに足す（1.4.0。前の形の集計と比べられるように）
+  return `${RAIL_LOOKS[k.rail].id}-${CAR_LOOKS[k.car].id}-${RIDER_LOOKS[k.rider].id}-${SCENE_LOOKS[k.scene].id}` + (k.tunnel ? `-${TUNNEL_LOOKS[k.tunnel].id}` : '');
 }
 // タイトルの後ろで走るお手本
 function demoDesign() {
@@ -858,12 +769,13 @@ const editor = new Editor(ui.editor, {
   onBack: () => toTitle(),
 });
 editor.onChange = () => saveDesign(editor.design);
+// 開きっぱなしのタブに、新しいバージョンを知らせる（走っている最中・設計の最中は出さない）
+const updater = watchUpdate({ url: 'js/main.js', current: VERSION, canShow: () => mode === 'title' || mode === 'result' || mode === 'intro' || mode === 'favs' });
+// アップデートのお知らせ。前に遊んだことがある＝つづきから・お気に入りがある
+const news = new News(document.getElementById('news'), document.getElementById('btn-news'), () => !!loadSaved() || loadFavs().length > 0);
 
 function toTitle() {
   sound.roll(0);
-  window.__coasterPendingStartMode = 'choose';
-  if (typeof window.__coasterHideStartModePicker === 'function') window.__coasterHideStartModePicker();
-  if (typeof window.__coasterClearStartModeWorld === 'function') window.__coasterClearStartModeWorld();
   setMode('title');
   replay = false;
   history.replaceState(null, '', location.pathname);
@@ -878,10 +790,17 @@ function toTitle() {
     co.demo = true;
   }
   resetRide();
+  news.onTitle();
 }
 function resetRide() {
   co.sim = new Sim(co.tr, co.design);
   co.sim.evI = 0;
+  photoDone = new Set();
+  drops = [];
+  wetT = 0;
+  water.list.length = 0;
+  flashT = 0;
+  shakeT = 0;
   for (const r of co.riders) {
     const i = co.riders.indexOf(r);
     const car = co.cars[Math.floor(i / 2)];
@@ -920,6 +839,7 @@ function startRide(d, fromShare = false, fromEditor = false) {
   }
   setupCoaster(nd);
   resetRide();
+  photo = null; // 記念写真は、新しく走らせるときだけ消す（もう一度見る・バーで戻るでは残す）
   lastRideCode = encode(nd);
   replay = fromShare;
   buildT = 0;
@@ -990,11 +910,50 @@ function updateRide(dt) {
   }
   if (n >= maxN) simAcc = 0;
   player.seen = Math.max(player.seen, sim.t);
-  // 長いコースでは再生時間を実走に合わせて延長。180秒などの固定上限は設けない。
-  if (sim.mode === 'done') player.dur = Math.max(0.1, sim.t);
-  else if (sim.t >= player.dur - 25) player.dur = sim.t + Math.max(25, player.dur * 0.08);
-  addPlayerMarks(sim.events);
   handleEvents(sim, sim.t);
+  // 水しぶきの中：先頭車の前と両わきから、しぶきを上げ続ける。先頭車の目線では、画面にも水滴をつける
+  {
+    const lf = sim.cars[0].f;
+    const sv = Math.abs(sim.v);
+    if (!stopped && n && sim.mode === 'track' && (co.tr.fl[lf.i] & F.SPLASH) && sv > 2) {
+      const k = Math.min(1, sv / 20);
+      const low = lf.y < 2.5;
+      if (low) {
+        if (povView()) frontSplash(lf, sv, Math.round(3 + 6 * k));
+        // 水の溝：船首の波のように、両わきへ高く広がる水の翼と、前へ上がる水の壁
+        for (let q = 0; q < Math.round(5 + 14 * k); q++) {
+          const sd = Math.random() < 0.5 ? -1 : 1;
+          const out = (4 + Math.random() * 6) * k + 1;
+          water.shoot(lf.x + lf.tx * 2 + lf.rx * sd * 1.2, 0.8, lf.z + lf.tz * 2 + lf.rz * sd * 1.2,
+            [lf.tx * sv * 0.35 + lf.rx * sd * out, 5 + 9 * k * Math.random() + 3 * k, lf.tz * sv * 0.35 + lf.rz * sd * out], '#c8e8ff', 1.2, 1.4, 9.8);
+        }
+      } else {
+        for (const [fw, sd] of [[2.5, -1.5], [2.5, 1.5]]) fx.burst(lf.x + lf.tx * fw + lf.rx * sd, lf.y + lf.uy * 0.3, lf.z + lf.tz * fw + lf.rz * sd, Math.round(2 + 4 * k), '#d8f2ff', 2 + 3 * k, 3, 0.9, 9.8);
+      }
+      if (povView()) {
+        wetT = Math.min(1.6, wetT + dt * 4);
+        if (Math.random() < dt * 20) addDrops(1);
+      }
+    }
+  }
+  wetT = Math.max(0, wetT - dt * 0.8);
+  if (!stopped) updateDrops(dt);
+
+  if (!stopped) fountains(dt);
+  // トンネル：出口の手前で、記念写真のフラッシュ（はじめて見ているときだけ）
+  // 写真は 1 枚だけ残る（後のトンネルで上書き）ので、フラッシュとシャッター音は最後のトンネルだけ。
+  // それより前のトンネルでは、音も光もなしで撮っておく（最後のトンネルの前で飛び出したときに写真が無くならないように。1.3.3）
+  if (!stopped && n && sim.mode === 'track' && !player.reviewed) {
+    const li = sim.cars[0].f.i;
+    const last = co.tunnels.length - 1;
+    for (const [k, r] of co.tunnels.entries()) {
+      const at = r.b - Math.round(10 / DS);
+      if (!photoDone.has(k) && li >= at && li <= r.b) {
+        photoDone.add(k);
+        takePhoto(r, k === last);
+      }
+    }
+  }
   // チェーンの音・走る音・悲鳴
   const sp = Math.abs(sim.v);
   if (sim.liftOn && sim.mode === 'track') {
@@ -1037,42 +996,43 @@ function updateRide(dt) {
 // 物理は同じ設計なら毎回同じに動くので、好きな時刻へは「最初からその時刻まで一気に計算し直す」で飛ぶ（1 走で 0.1 秒ほど）。
 // 飛んだときは音・ポップアップは出さず、場面だけを写す
 const player = { dur: 0, marks: [], seen: 0, paused: false, scrub: false, pending: null, reviewed: false };
-const MARK_ICON = { invert: '🌀', jump: '🦘', eject: '🚀', break: '💥', crash: '💥', miss: '💥', clash: '💥', overrun: '🛑', stuck: '🛑', rollbackStop: '🛑', splash: '💦', star: '⭐' };
+const MARK_ICON = { invert: '🌀', jump: '🦘', spray: '💦', drop: '⬇️', eject: '🚀', break: '💥', crash: '💥', miss: '💥', clash: '💥', overrun: '🛑', stuck: '🛑', rollbackStop: '🛑', splash: '💦', star: '⭐' };
 const MARK_NAME = { invert: '宙返り', jump: 'ジャンプ', eject: 'お客さんが飛んだ', break: '線路が折れた', crash: '事故', miss: '着地失敗', clash: '線路がぶつかった', overrun: '止まれない', stuck: '止まった', rollbackStop: '戻ってきた', splash: 'ザブーン', star: '遠くまで飛んだ' };
 let barPref = 'on';
 try {
   barPref = localStorage.getItem('rc_bar') || 'on';
 } catch (e) { /* 保存できなくても使える */ }
 ui.ride.dataset.bar = barPref;
-// 走行時間は概算から開始し、実走行に合わせて延長する。イベント印も実走中に追加する。
+// 走り始める前に、最後まで計算して、長さと印（事故・宙返りなど）を出しておく
 function prepPlayer() {
-  // 走行開始前に最後まで同期試走すると、高高度コースで画面が固まる。
-  // 初期値は概算にし、実走行中に必要なら延長、完走時に正確な時間へ確定する。
-  const liftEstimate = co.design.start === 0 ? Math.max(0, co.tr.maxH - 2) / 4.2 : 0;
-  player.dur = Math.max(30, co.tr.L / 18 + liftEstimate + 20);
+  const s = new Sim(co.tr, co.design);
+  s.runToEnd();
+  player.dur = s.t;
   player.seen = 0;
   player.paused = false;
   player.scrub = false;
   player.pending = null;
   player.reviewed = false;
-  player.marks = [];
+  const marks = [];
+  for (const e of s.events) {
+    const icon = MARK_ICON[e.type];
+    if (!icon) continue;
+    // 同じ印が近くに続くとき（何人も飛ぶ・崩れる）は 1 つにまとめる
+    if (marks.some((m) => m.icon === icon && Math.abs(m.t - e.t) < 2.5)) continue;
+    if (marks.some((m) => Math.abs(m.t - e.t) < 0.4)) continue;
+    marks.push({ t: e.t, icon, name: MARK_NAME[e.type] });
+    if (marks.length >= 14) break;
+  }
+  player.marks = marks;
   const box = ui.plTrack.querySelector('.pl-marks');
   box.innerHTML = '';
-  ui.plDur.textContent = player.dur.toFixed(1);
-  refreshPlay();
-}
-function addPlayerMarks(events) {
-  const box = ui.plTrack.querySelector('.pl-marks');
-  for (const e of events) {
-    const icon = MARK_ICON[e.type];
-    if (!icon || player.marks.length >= 14) continue;
-    if (player.marks.some((m) => m.icon === icon && Math.abs(m.t - e.t) < 2.5)) continue;
-    if (player.marks.some((m) => Math.abs(m.t - e.t) < 0.4)) continue;
-    const m = { t: e.t, icon, name: MARK_NAME[e.type] };
+  for (const m of marks) {
     const el = document.createElement('span');
     el.textContent = m.icon;
     el.title = m.name;
+    el.style.left = `${(m.t / Math.max(0.1, player.dur)) * 100}%`;
     el.hidden = true;
+    // 印をタップ：その少し手前から見る
     el.addEventListener('pointerdown', (ev) => {
       ev.stopPropagation();
       sound.sfx('tap');
@@ -1080,18 +1040,18 @@ function addPlayerMarks(events) {
       player.paused = false;
     });
     m.el = el;
-    player.marks.push(m);
     box.appendChild(el);
   }
+  ui.plDur.textContent = player.dur.toFixed(1);
+  refreshPlay();
 }
-
 function seekTo(t) {
+  wetT = 0;
+  drops = [];
   t = clamp(t, 0, player.dur);
   resetRide();
   const sim = co.sim;
   while (sim.mode !== 'done' && sim.t < t) sim.step();
-  if (sim.mode === 'done') player.dur = Math.max(0.1, sim.t);
-  addPlayerMarks(sim.events);
   sim.evI = sim.events.length;
   // 飛ぶ前に起きたことのうち、場面に残るもの（事故の場所・逃げる観客・飛んだ人の目線）だけを写す
   for (const e of sim.events) {
@@ -1109,6 +1069,8 @@ function seekTo(t) {
     }
   }
   fx.list.length = 0;
+  water.list.length = 0;
+  flashT = 0;
   simAcc = 0;
   endT = sim.mode === 'done' ? 2.6 : 0;
   player.seen = Math.max(player.seen, sim.t);
@@ -1142,11 +1104,9 @@ function renderPlayer() {
   ui.plNow.textContent = t.toFixed(1);
   // はじめて見ているときは、まだ見ていない所の印は出さない（何が起きるか先に分かってしまう）
   for (const m of player.marks) {
-    m.el.style.left = `${clamp(m.t / Math.max(0.1, player.dur), 0, 1) * 100}%`;
     const hide = !(player.reviewed || m.t <= player.seen + 0.05);
     if (m.el.hidden !== hide) m.el.hidden = hide;
   }
-  ui.plDur.textContent = player.dur.toFixed(1);
   refreshPlay();
 }
 function seekFromX(clientX) {
@@ -1223,7 +1183,7 @@ function collectIncidents(sim) {
     if (out.some((o) => o.type === type && Math.hypot(o.x - e.x, o.z - e.z) < 8)) continue;
     const i = nearestIndex(co.tr, e.x, e.y, e.z);
     // カーブ（半径 40 m より急）で線路が折れた・飛ばされた：① で「事故が起きたカーブをゆるくする」を出す
-    const curve = (type === 'break' || type === 'eject') && !(co.tr.fl[i] & F.LOOP) && curveRadius(co.tr, i) < 40;
+    const curve = (type === 'break' || type === 'eject') && !(co.tr.fl[i] & (F.LOOP | F.ROLL)) && curveRadius(co.tr, i) < 40;
     out.push({ type, i, x: co.tr.px[i], z: co.tr.pz[i], curve });
     if (out.length >= 12) break;
   }
@@ -1236,8 +1196,9 @@ function onResult(r) {
   if (!replay) editor.setIncidents(incidents);
   sound.roll(0);
   const sg = shownGrade(r);
-  sound.sfx(sg === 'great' ? 'great' : sg === 'ok' || sg === 'faint' ? 'ok' : sg === 'fail' ? 'fail' : 'bigfail');
-  if (sg === 'great' || sg === 'ok' || sg === 'faint') sound.sfx('cheer', 1.4);
+  sound.sfx(sg === 'super' || sg === 'superfail' || sg === 'great' || sg === 'fail' ? sg : sg === 'ok' || sg === 'faint' ? 'ok' : 'bigfail');
+  if (sg === 'super' || sg === 'great' || sg === 'ok' || sg === 'faint') sound.sfx('cheer', sg === 'super' ? 2.2 : 1.4);
+  if (sg === 'superfail') sound.sfx('gasp');
   track('level_end', {
     mode: replay ? 'shared' : 'own', grade: r.grade, fainted: r.fainted, fun: r.fun, safe: r.safe, result: r.result, why: r.why,
     max_kmh: Math.round(r.maxV * 3.6), max_g: Math.round(r.maxG * 10) / 10, ejected: r.ejected, inversions: r.inv, jumps: r.jumps, collapse: r.collapse,
@@ -1250,9 +1211,6 @@ function skipRide() {
   sound.sfx('tap');
   const sim = co.sim;
   sim.runToEnd();
-  player.dur = Math.max(0.1, sim.t);
-  player.seen = Math.max(player.seen, sim.t);
-  addPlayerMarks(sim.events);
   sim.evI = sim.events.length;
   for (const e of sim.events) {
     if (e.type === 'crash') {
@@ -1266,6 +1224,9 @@ function skipRide() {
 
 // ---------------- 結果 ----------------
 const GRADE = {
+  // めったに出ない結果（1.3.0）
+  super: { text: '超成功！！！', color: '#ffe680', rare: 'めったに出ない 超成功です！' },
+  superfail: { text: '超失敗！！！', color: '#ff5a8a', rare: 'めったに出ない 超失敗です…！' },
   great: { text: '大成功！', color: '#ffd84a' },
   ok: { text: '成功', color: '#7fff9a' },
   fail: { text: '失敗…', color: '#c8c8ff' },
@@ -1275,6 +1236,8 @@ const GRADE = {
 // 見せる評価：半分以上が気絶した成功は「成功（気絶）」と見せる（判定は成功。1.0.4 までは失敗だった）
 const shownGrade = (r) => (r.grade === 'ok' && r.fainted >= r.riders / 2 ? 'faint' : r.grade);
 function headline(r) {
+  if (r.grade === 'super') return '楽しさも 安全も 文句なし！';
+  if (r.grade === 'superfail') return '全員飛んで コースターも崩れ落ちた…';
   if (r.collapse) return 'ジェットコースターが まるごと崩れ落ちた…';
   if (r.why === 'overrun') return '駅で止まれずに 突っ込んだ！';
   if (r.why === 'clash') return '線路どうしが ぶつかっていた！';
@@ -1291,6 +1254,8 @@ function headline(r) {
   return '全員 無事に帰ってきた！';
 }
 function crowdLine(r) {
+  if (r.grade === 'super') return '観客：「すごすぎる！」「一生に一度は乗りたい！」';
+  if (r.grade === 'superfail') return '観客：「伝説の大事故だ…」「今の 誰か撮ってた！？」';
   if (r.collapse) return '観客：「えっ…」「動画とった！」';
   if (r.result === 'crash') return '観客：「うわぁぁ！」「逃げろー！」';
   if (r.stars) return '観客：「いま 空で何か光った…？」';
@@ -1310,6 +1275,14 @@ function showResult() {
   const el = ui.result;
   el.querySelector('.stamp').textContent = g.text;
   el.querySelector('.stamp').style.color = g.color;
+  const ph = document.getElementById('rc-photo');
+  ph.classList.remove('big');
+  ph.hidden = !photo;
+  el.classList.toggle('has-photo', !!photo);
+  if (photo) ph.querySelector('img').src = photo.toDataURL('image/jpeg', 0.88);
+  const rare = el.querySelector('.rare');
+  rare.textContent = g.rare || '';
+  rare.hidden = !g.rare;
   el.dataset.grade = shownGrade(r);
   el.querySelector('.head').textContent = headline(r);
   el.querySelector('.crowd').textContent = crowdLine(r);
@@ -1344,6 +1317,12 @@ const fmtDate = (t) => {
   return `${d.getMonth() + 1}/${d.getDate()} ${d.getHours()}:${String(d.getMinutes()).padStart(2, '0')}`;
 };
 // 結果の画面のお気に入りのボタン：保存 / 保存済み / 上書き・新しく保存
+// お気に入りの文字列が、いま走らせたコースと同じか（1.2.x までに保存したものは物理の版の値がないので、読み直してそろえる）
+function sameCode(code) {
+  if (code === lastRideCode) return true;
+  const d = decode(code);
+  return !!d && encode(d) === lastRideCode;
+}
 function refreshFavRow() {
   const row = document.getElementById('fav-row');
   const note = document.getElementById('fav-note');
@@ -1352,14 +1331,14 @@ function refreshFavRow() {
   if (!cur) favId = null;
   const full = list.length >= MAX_FAVS;
   const btn = (id, text, cls, disabled = false) => `<button id="${id}" class="btn ${cls}" type="button"${disabled ? ' disabled' : ''}>${text}</button>`;
-  if (cur && cur.code === lastRideCode) {
+  if (cur && sameCode(cur.code)) {
     row.innerHTML = btn('btn-fav-done', `★ お気に入りに保存済み`, 'btn-fav', true);
   } else if (cur) {
     row.innerHTML = btn('btn-fav-over', '★ 上書き保存', 'btn-fav') + btn('btn-fav-new', '☆ 新しく保存', 'btn-sub2', full);
   } else {
     row.innerHTML = btn('btn-fav-new', '☆ お気に入りに保存', 'btn-fav', full);
   }
-  note.textContent = full && !(cur && cur.code === lastRideCode) ? `お気に入りは ${MAX_FAVS} 個までです（タイトルの「お気に入り」から消せます）` : cur ? `お気に入り「${cur.name}」` : '';
+  note.textContent = full && !(cur && sameCode(cur.code)) ? `お気に入りは ${MAX_FAVS} 個までです（タイトルの「お気に入り」から消せます）` : cur ? `お気に入り「${cur.name}」` : '';
   row.querySelector('#btn-fav-new')?.addEventListener('click', () => {
     const l = loadFavs();
     if (l.length >= MAX_FAVS) return;
@@ -1432,6 +1411,7 @@ function favAction(a, id) {
   if (a === 'ride' || a === 'edit') {
     const d = decode(f.code);
     if (!d) return;
+    d.normed = ptsKey(d.pts); // お気に入りは丸めた形
     favId = f.id;
     replay = false;
     history.replaceState(null, '', location.pathname);
@@ -1478,6 +1458,16 @@ function shareText(r) {
 function openShare(url) {
   window.open(url, '_blank', 'noopener,noreferrer');
 }
+document.getElementById('rc-photo').addEventListener('click', (e) => {
+  e.currentTarget.classList.toggle('big');
+  sound.sfx('tap');
+});
+// div にしたので、キーボードでも押せるようにする
+document.getElementById('rc-photo').addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  e.preventDefault();
+  e.currentTarget.click();
+});
 document.getElementById('btn-x').addEventListener('click', () => {
   if (!result) return;
   track('share', { method: 'x', content_type: result.grade });
@@ -1519,6 +1509,7 @@ document.getElementById('btn-again').addEventListener('click', () => {
 function editAgain() {
   sound.sfx('tap');
   const d = decode(encode(co.design));
+  if (d) d.normed = ptsKey(d.pts); // 走らせたコースは丸めた形
   const step = replay ? 3 : backStep;
   replay = false;
   history.replaceState(null, '', location.pathname);
@@ -1535,32 +1526,16 @@ document.getElementById('btn-new').addEventListener('click', () => {
   history.replaceState(null, '', location.pathname);
   editor.setIncidents([]);
   openEditor(newDesign(cleanMap(co?.design.map)), 1);
-  if (typeof window.__coasterAfterStartMode === 'function') window.__coasterAfterStartMode('normal');
 });
 document.getElementById('btn-totitle').addEventListener('click', () => {
   sound.sfx('tap');
   toTitle();
 });
-// Start screen: the native 'コースをつくる' button opens the three course modes.
-window.__coasterPendingStartMode = 'choose';
 document.getElementById('btn-start').addEventListener('click', () => {
-  const selectedMode = window.__coasterPendingStartMode || 'choose';
-  window.__coasterPendingStartMode = 'choose';
   sound.sfx('tap');
-  if (selectedMode === 'choose' && typeof window.__coasterShowStartModePicker === 'function') {
-    window.__coasterShowStartModePicker();
-    return;
-  }
-  const mode = selectedMode === 'choose' ? 'normal' : selectedMode;
   favId = null;
   editor.setIncidents([]);
-  const prepared = typeof window.__coasterCreateStartDesign === 'function'
-    ? window.__coasterCreateStartDesign(mode)
-    : null;
-  openEditor(prepared || newDesign(), 1);
-  if (typeof window.__coasterAfterStartMode === 'function') {
-    window.__coasterAfterStartMode(mode);
-  }
+  openEditor(newDesign(), 1);
 });
 document.getElementById('btn-continue').addEventListener('click', () => {
   sound.sfx('tap');
@@ -1572,14 +1547,19 @@ document.getElementById('btn-continue').addEventListener('click', () => {
 });
 document.getElementById('btn-play-shared').addEventListener('click', () => {
   sound.sfx('tap');
+  if (introNewer) {
+    try {
+      sessionStorage.setItem('rc_newer', new URLSearchParams(location.search).get('c') || '');
+    } catch (e) { /* 覚えられなくても読み込み直す */ }
+    location.reload();
+    return;
+  }
   favId = null;
   if (sharedDesign) startRide(sharedDesign, true);
 });
 document.getElementById('btn-intro-title').addEventListener('click', () => toTitle());
 ui.camBtn.addEventListener('click', () => {
   cam.mode = CAM_MODES[(CAM_MODES.indexOf(cam.mode) + 1) % CAM_MODES.length];
-  if (cam.mode === 'free') activateFreeCamera();
-  else freeCamPanel.hidden = true;
   ui.camBtn.textContent = `🎥 ${CAM_NAMES[cam.mode]}`;
   cam.shotT = 0;
   sound.sfx('tap');
@@ -1615,7 +1595,8 @@ ui.mute.addEventListener('click', () => {
 refreshMute();
 addEventListener('keydown', (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey) return;
-  if (e.key === 'm' || e.key === 'M') {
+  if (e.key === 'Escape' && news.isOpen) news.close();
+  else if (e.key === 'm' || e.key === 'M') {
     sound.setMuted(!sound.muted);
     refreshMute();
   } else if ((e.key === 'c' || e.key === 'C') && mode === 'ride') ui.camBtn.click();
@@ -1652,21 +1633,49 @@ addEventListener('blur', () => {
   holdFF = false;
 });
 
-// iPhone で連打したときのダブルタップ拡大・ピンチ拡大を止める（viewport の user-scalable=no は iOS では効かない）。
-// 400 ms 以内の 2 回目のタップは touchend を止める。止めるとボタンの click が来ないので、ボタンは自分で押す（元に戻すの連打など）。
-// リンクは対象外
+// iPhone で連打したときのダブルタップ拡大・ピンチ拡大を、ページ全体で止める（viewport の user-scalable=no は iOS では効かない）。
+// 2026-11-02：合唱コンクール 0.4.29 と同じ形にそろえた。コントローラーとゲーム画面の中だけで止めていたので、
+// 連打の途中で指がすき間・余白・下の文字に出ると拡大された。また、拡大されたあとは縮める操作まで止めてしまい、
+// リロードしても戻らなかった（iPhone の Safari はリロードでも拡大率を覚えている）。拡大されているあいだは、縮める操作を止めない。
+const zoomed = () => !!(window.visualViewport && window.visualViewport.scale > 1.01);
 let lastTouchEnd = 0;
 document.addEventListener('touchend', (e) => {
   const t = Date.now();
   const el = e.target;
-  if (t - lastTouchEnd < 400 && !(el.closest && el.closest('a'))) {
+  if (t - lastTouchEnd < 400 && !zoomed() && !(el && el.closest && el.closest('a'))) {
     e.preventDefault();
-    const btn = el.closest && el.closest('button');
+    // 止めると 2 回目の click が来ないので、ボタンは自分で押す（pointer イベントで受けているボタンは押さない）
+    const btn = el && el.closest && el.closest('button');
     if (btn && !btn.disabled) btn.click();
   }
   lastTouchEnd = t;
 }, { passive: false });
-for (const ev of ['gesturestart', 'gesturechange', 'dblclick']) document.addEventListener(ev, (e) => e.preventDefault(), { passive: false });
+document.addEventListener('dblclick', (e) => {
+  if (!zoomed()) e.preventDefault();
+}, { passive: false });
+// ピンチ：タイトルの下の説明・注意書き（`.menu`）以外で、拡大されていないときに始まったものだけ止める。
+// ほかの場所（注意書きなど読むための文字）は、広げて読めるよう通す（2 回タップと違って、連打で勝手に起きることはない）。
+// 拡大中に始まったものは、縮めて戻せるよう通す
+let gestureAllowed = false;
+document.addEventListener('gesturestart', (e) => {
+  gestureAllowed = zoomed() || !!(e.target && e.target.closest && e.target.closest('.menu'));
+  if (!gestureAllowed) e.preventDefault();
+}, { passive: false });
+document.addEventListener('gesturechange', (e) => {
+  if (!gestureAllowed) e.preventDefault();
+}, { passive: false });
+document.addEventListener('gestureend', () => { gestureAllowed = false; });
+// 開いた時点で拡大されていたら（前に拡大されたままリロードした）、viewport を書き直して等倍に戻す（効くかは iOS 次第）
+const resetZoom = () => {
+  if (!zoomed()) return;
+  const vp = document.querySelector('meta[name="viewport"]');
+  if (!vp) return;
+  const c = vp.getAttribute('content');
+  vp.setAttribute('content', c.replace(/,?\s*maximum-scale=[^,]*/, '') + ', maximum-scale=1.0');
+  setTimeout(() => vp.setAttribute('content', c), 300);
+};
+resetZoom();
+window.addEventListener('pageshow', resetZoom);
 
 // ---------------- タイトル ----------------
 function updateTitle(dt) {
@@ -1757,12 +1766,212 @@ function drawTitleHUD() {
   txt('手で描いた線で物理シミュレーション', HW / 2, sy + ss + 16, { size: 14, align: 'center', color: '#ffffff', outline: '#2b3a55', ow: 4 });
 }
 
+// ---------------- 水しぶき・トンネルの演出（1.3.0） ----------------
+let shakeT = 0;
+// 水の溝に突っ込んだ瞬間：前へ高く上がる水の壁と、両わきへ大きく広がる水の翼
+function bigSplash(sim, v) {
+  const f = sim.cars[0].f;
+  const k = Math.min(1.3, v / 18);
+  for (let q = 0; q < Math.round(380 * k + 140); q++) {
+    const sd = (Math.random() - 0.5) * 2;
+    const fw = Math.random();
+    const out = sd * (7 + 10 * k);
+    water.shoot(f.x + f.tx * (2 + fw * 4) + f.rx * sd * 1.5, 0.8, f.z + f.tz * (2 + fw * 4) + f.rz * sd * 1.5,
+      [f.tx * v * (0.3 + 0.4 * fw) + f.rx * out, 9 + Math.random() * (12 + 8 * k), f.tz * v * (0.3 + 0.4 * fw) + f.rz * out], Math.random() < 0.5 ? '#d8f0ff' : '#9fd0f0', 1.5, 2.4, 9.8);
+  }
+  // 霧（ゆっくり落ちる）
+  water.burst(f.x + f.tx * 4, 2, f.z + f.tz * 4, 30, '#e8f6ff', 6, 3, 2.2, 1.5);
+  if (povView()) {
+    wetT = 2.2;
+    addDrops(45, 1.2);
+    frontSplash(f, v, 160);
+  }
+}
+// 先頭車の目線：前に立ち上がる水の壁（列車より遅く前へ飛ぶので、こちらへ向かってくるように見える）
+function frontSplash(f, v, n) {
+  for (let q = 0; q < n; q++) {
+    const ahead = 4 + Math.random() * 9;
+    const sd = (Math.random() - 0.5) * 3.2;
+    water.shoot(f.x + f.tx * ahead + f.rx * sd, 0.8 + Math.random() * 1.2, f.z + f.tz * ahead + f.rz * sd,
+      [f.tx * v * (0.15 + Math.random() * 0.3) + f.rx * sd * 1.5, 4 + Math.random() * 7, f.tz * v * (0.15 + Math.random() * 0.3) + f.rz * sd * 1.5], Math.random() < 0.5 ? '#d8f0ff' : '#9fd0f0', 1, 1.2, 9.8);
+  }
+}
+// 先頭車の目線で見ているか（中継の先頭車のカットも）
+function povView() {
+  return cam.mode === 'pov' ? !cam.povBody : cam.mode === 'auto' && cam.shot === 'pov';
+}
+// 水のカーテン（高い所の水しぶき）：両わきの噴き出し口から、線路の上を越える水のアーチをいつも出しておく
+function fountains(dt) {
+  if (!co.splashes.length) return;
+  const tr = co.tr;
+  for (const r of co.splashes) {
+    if (tr.py[r.a] < 2.5) continue;
+    for (let i = r.a; i <= r.b; i += 8) {
+      if (Math.random() > dt * 14) continue;
+      const sd = (i >> 3) % 2 ? 1 : -1;
+      const x = tr.px[i] + tr.rx[i] * sd * 1.5;
+      const y = tr.py[i] + tr.ry[i] * sd * 1.5;
+      const z = tr.pz[i] + tr.rz[i] * sd * 1.5;
+      water.shoot(x, y, z, [-tr.rx[i] * sd * 2.2 + tr.ux[i] * 4.5, -tr.ry[i] * sd * 2.2 + tr.uy[i] * 4.5 + 1, -tr.rz[i] * sd * 2.2 + tr.uz[i] * 4.5], '#9fd8ff', 0.3, 1.1, 9.8);
+    }
+  }
+}
+// トンネルの記念写真：出口の内側のカメラから、来る列車を写す（結果の画面に出す）
+let photo = null;
+let photoDone = new Set();
+let flashT = 0;
+const photoCam = new THREE.PerspectiveCamera(62, 4 / 3, 0.1, 500);
+function takePhoto(r, show = true) {
+  const tr = co.tr;
+  const e = tr.wrap(r.b - 2);
+  photoCam.position.set(tr.px[e] + tr.ux[e] * 2.2, tr.py[e] + tr.uy[e] * 2.2, tr.pz[e] + tr.uz[e] * 2.2);
+  photoCam.up.set(tr.ux[e], tr.uy[e], tr.uz[e]);
+  const lead = co.sim.cars[0];
+  photoCam.lookAt(lead.p[0] + lead.f.ux * 1.2, lead.p[1] + lead.f.uy * 1.2, lead.p[2] + lead.f.uz * 1.2);
+  const W = 480;
+  const H = 360;
+  const c = document.createElement('canvas');
+  c.width = W;
+  c.height = H;
+  const size = new THREE.Vector2();
+  renderer.getSize(size);
+  photoCam.aspect = size.x / size.y;
+  photoCam.updateProjectionMatrix();
+  renderer.render(scene3d, photoCam);
+  const src = renderer.domElement;
+  // 真ん中を 4:3 で切り出す
+  const sw = Math.min(src.width, (src.height * 4) / 3);
+  const sh = (sw * 3) / 4;
+  const x = c.getContext('2d');
+  x.drawImage(src, (src.width - sw) / 2, (src.height - sh) / 2, sw, sh, 0, 0, W, H);
+  // フラッシュで白っぽく（下に入れていた「📸 トンネルの記念写真」の帯は、保存した写真に要らないので 1.3.5 でやめた）
+  x.fillStyle = 'rgba(255,255,255,0.12)';
+  x.fillRect(0, 0, W, H);
+  photo = c;
+  if (!show) return;
+  flashT = 0.5;
+  sound.sfx('shutter');
+}
 // ---------------- 走っている間の HUD ----------------
+// 先頭車の目線で水しぶきを浴びたときの、画面の水滴（位置は決まった並び。wetT で薄くなって消える）
+let wetT = 0;
+// 画面についた水滴（先頭車の目線）。x・y は画面の割合、r は大きさ（HUD の単位）。大きいものは下へ流れ落ち、筋を残す
+let drops = [];
+const MAX_DROPS = COARSE ? 24 : 60; // スマホは少なめ（水滴ごとに景色を写すので重い）
+function addDrops(n, big = 1) {
+  for (let k = 0; k < (COARSE ? Math.ceil(n / 2) : n); k++) {
+    if (drops.length >= MAX_DROPS) drops.shift();
+    const r = (3 + Math.random() ** 2.2 * 22) * big;
+    drops.push({ x: Math.random(), y: Math.random() * 0.9, r, sq: 0.75 + Math.random() * 0.4, vy: r > 12 ? 0.02 + Math.random() * 0.06 : 0, t: 0, life: 2.5 + Math.random() * 2.5, y0: 0 });
+  }
+}
+function updateDrops(dt) {
+  for (const d of drops) {
+    d.t += dt;
+    if (!d.y0) d.y0 = d.y;
+    d.y += d.vy * dt;
+    d.vy *= 1 + dt * 0.6; // 流れ出すと少しずつ速くなる
+  }
+  drops = drops.filter((d) => d.t < d.life && d.y < 1.05);
+}
+let wetCv = null;
+let wetCx = null;
+// 浴びた直後は 3D の画面を少しぼかす（値が変わったときだけ書きかえる）
+let wetBlur = 0;
+function setWetBlur(px) {
+  if (px === wetBlur) return;
+  wetBlur = px;
+  cvs.style.filter = px ? `blur(${px}px)` : '';
+}
+// 記念写真のフラッシュ。画面を真っ白にはせず、ふわっと明るくするだけ（強い光の点滅で体調を崩す人がいるため。1.2.18）
+function drawTunnel() {
+  if (mode !== 'ride' || flashT <= 0) return;
+  hx.fillStyle = `rgba(255,255,255,${Math.min(0.3, flashT * 0.6)})`;
+  hx.fillRect(0, 0, HW, HH);
+}
+function drawWet() {
+  const on = mode === 'ride' && povView() && (wetT > 0 || drops.length);
+  setWetBlur(on ? Math.min(3, Math.round(wetT * 1.6)) : 0);
+  if (!on) return;
+  // 3D の画面を、1 コマに 1 回だけ小さな裏の画面へ写す（水滴はそこから景色を映す。水滴ごとに 3D の画面から写すと、スマホで重い）
+  if (!wetCv) {
+    wetCv = document.createElement('canvas');
+    wetCx = wetCv.getContext('2d');
+  }
+  const ww = Math.max(1, Math.round(HW / 3));
+  const wh = Math.max(1, Math.round(HH / 3));
+  if (wetCv.width !== ww || wetCv.height !== wh) {
+    wetCv.width = ww;
+    wetCv.height = wh;
+  }
+  try {
+    wetCx.drawImage(cvs, 0, 0, ww, wh);
+  } catch (e) { /* 写せなければ前のまま */ }
+  const sw = ww / HW;
+  const sh = wh / HH;
+  hx.save();
+  // 浴びた直後の、うすい水の膜
+  if (wetT > 0) {
+    hx.fillStyle = `rgba(210,232,245,${0.12 * Math.min(1, wetT)})`;
+    hx.fillRect(0, 0, HW, HH);
+  }
+  for (const d of drops) {
+    const a = Math.min(1, (d.life - d.t) / 0.8) * Math.min(1, d.t / 0.05 + 0.3);
+    const x = d.x * HW;
+    const y = d.y * HH;
+    const rx = d.r;
+    const ry = d.r * d.sq;
+    hx.globalAlpha = a;
+    // 流れ落ちた筋（うすく残る水の跡）
+    if (d.vy && d.y > d.y0 + 0.005) {
+      // 細く、上へ行くほど消える
+      const top = Math.max(d.y0 * HH, y - HH * 0.25);
+      const tg = hx.createLinearGradient(0, top, 0, y);
+      tg.addColorStop(0, 'rgba(225,238,248,0)');
+      tg.addColorStop(1, 'rgba(225,238,248,0.22)');
+      hx.fillStyle = tg;
+      hx.beginPath();
+      hx.moveTo(x - rx * 0.06, top);
+      hx.lineTo(x + rx * 0.06, top);
+      hx.lineTo(x + rx * 0.22, y);
+      hx.lineTo(x - rx * 0.22, y);
+      hx.fill();
+    }
+    // 水滴の中：裏の景色を、上下逆さに小さく映す（レンズになる）
+    hx.save();
+    hx.beginPath();
+    hx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+    hx.clip();
+    hx.translate(x, y);
+    hx.scale(1, -1);
+    const span = rx * 3.2;
+    try {
+      hx.drawImage(wetCv, (x - span) * sw, (y - span) * sh, span * 2 * sw, span * 2 * sh, -rx, -ry, rx * 2, ry * 2);
+    } catch (e) { /* 描けなければ景色なし */ }
+    hx.restore();
+    // ふちの影（下側が濃い）と、光の当たった点
+    const g = hx.createRadialGradient(x, y - ry * 0.25, ry * 0.4, x, y, Math.max(rx, ry));
+    g.addColorStop(0, 'rgba(255,255,255,0)');
+    g.addColorStop(0.75, 'rgba(255,255,255,0.05)');
+    g.addColorStop(1, 'rgba(20,40,60,0.45)');
+    hx.fillStyle = g;
+    hx.beginPath();
+    hx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+    hx.fill();
+    hx.fillStyle = 'rgba(255,255,255,0.85)';
+    hx.beginPath();
+    hx.ellipse(x - rx * 0.35, y - ry * 0.4, rx * 0.22, ry * 0.14, -0.5, 0, Math.PI * 2);
+    hx.fill();
+  }
+  hx.restore();
+}
 function drawRideHUD() {
   if (!co) return;
   const sim = co.sim;
   const lead = sim.cars[0];
   const top = 8 + safeTop();
+  drawTunnel();
+  drawWet();
   if (mode === 'ride' && sim.mode !== 'done') {
     const kmh = Math.round(Math.abs(sim.v) * 3.6);
     rbox(10, top, 128, 62, 10, 'rgba(20,24,40,0.55)');
@@ -1822,13 +2031,42 @@ function safeTop() {
 
 // ---------------- シェアされたコース ----------------
 let sharedDesign = null;
+// シェアされたコースの画面の文（新しい版のコースの案内と切りかえるので、もとの文を覚えておく）
+const INTRO_TEXT = { kicker: ui.intro.querySelector('.kicker').textContent, h2: ui.intro.querySelector('h2').textContent, btn: document.getElementById('btn-play-shared').textContent };
+let introNewer = false;
+function setIntroNewer(on) {
+  introNewer = on;
+  ui.intro.querySelector('.kicker').textContent = on ? 'このコースは、新しいバージョンで作られています' : INTRO_TEXT.kicker;
+  ui.intro.querySelector('h2').textContent = on ? 'ゲームを最新にしてください' : INTRO_TEXT.h2;
+  document.getElementById('btn-play-shared').textContent = on ? '↻ 最新にする' : INTRO_TEXT.btn;
+}
 function openShared(code) {
-  const d = decode(code);
+  const info = {};
+  const d = decode(code, info);
+  // 読み込み直しても、まだ新しい版のコースと出る：壊れたリンクとみなす（「最新にする」をくり返さない）
+  let retried = false;
+  try {
+    retried = sessionStorage.getItem('rc_newer') === code;
+  } catch (e) { /* 覚えられなければ毎回案内する */ }
+  if (!d && info.newer && !retried) {
+    // 新しい版のゲームで作られたコース：読み込み直すと最新の版になる（ファイルは毎回、新しいか確かめて配っている）
+    if (!co || !co.demo) {
+      setupCoaster(demoDesign());
+      co.demo = true;
+      resetRide();
+    }
+    setMode('intro');
+    setIntroNewer(true);
+    ui.intro.querySelector('.meta').textContent = `いまのバージョン：${VERSION}`;
+    return;
+  }
   if (!d) {
     toTitle();
     popup('コースを読み込めませんでした', '#ff9a9a', 22);
     return;
   }
+  setIntroNewer(false);
+  d.normed = ptsKey(d.pts); // シェアのリンクは丸めた形
   sharedDesign = d;
   if (!co || !co.demo) {
     setupCoaster(demoDesign());
@@ -1867,16 +2105,7 @@ function frame(now) {
   last = now;
   if (!window.__rc || !window.__rc.paused) tick(dt);
 }
-let extensionFrameHook = null;
 function tick(dt, render = true) {
-  if (extensionFrameHook) {
-    try { extensionFrameHook(dt); }
-    catch (error) { console.error('[Coaster Expansion frame hook]', error); extensionFrameHook = null; }
-    if (extensionFrameHook) {
-      if (render) renderer.render(scene3d, camera);
-      return;
-    }
-  }
   modeT += dt;
   for (const p of popups) p.t += dt;
   while (popups.length && popups[0].t > 2.2) popups.shift();
@@ -1895,6 +2124,17 @@ function tick(dt, render = true) {
     setCam(c[0] + Math.cos(cam.orbit) * R, sim.st.collapse ? 45 : 18, c[2] + Math.sin(cam.orbit) * R, c[0], 3, c[2], 1, dt);
   }
   if (!render) return;
+  water.update(dt);
+  flashT = Math.max(0, flashT - dt);
+  // 走っている画面を離れたら、水のぼかしを消す
+  if (mode !== 'ride') setWetBlur(0);
+  // 画面の揺れ（水しぶきに突っ込んだとき）
+  if (shakeT > 0) {
+    shakeT = Math.max(0, shakeT - dt);
+    const a = shakeT * 0.5;
+    camera.position.x += (Math.random() - 0.5) * a;
+    camera.position.y += (Math.random() - 0.5) * a;
+  }
   if (mode !== 'edit') renderer.render(scene3d, camera);
   hudBegin();
   if (mode === 'title') drawTitleHUD();
@@ -1932,73 +2172,9 @@ boot();
 
 // デバッグ用（コンソールから）。__rc.step(n) でフレームを手動で進める。本番では出さない（localhost とプレビューだけ）
 if (DEBUG_OK) window.__rc = {
-  get co() { return co; }, get mode() { return mode; }, get result() { return result; }, editor, renderer, camera, scene3d, THREE, cam,
+  get co() { return co; }, get mode() { return mode; }, get result() { return result; }, editor, renderer, camera, scene3d, THREE, cam, updater,
   step: (n = 1, dt = 1 / 60) => { for (let i = 0; i < n; i++) tick(dt, i === n - 1); },
   ride: (d) => startRide(d),
   skip: () => skipRide(),
   encode, decode, randomStroke, defaultHeights, buildTrack, Sim, prepare, H_SAMPLES, BUDGET, FIELD, F,
 };
-
-// 拡張版 v8：本番でも追加機能がゲーム内部へ接続できるよう、必要なAPIだけ公開する。
-// 既存のデバッグAPIとは別名・別オブジェクトにし、ゲームの通常動作は変えない。
-const coasterExpansionRuntime = {
-  get editor() { return editor; },
-  get co() { return co; },
-  get scene3d() { return scene3d; },
-  get camera() { return camera; },
-  get renderer() { return renderer; },
-  get THREE() { return THREE; },
-  get mode() { return mode; },
-  get sim() { return co ? co.sim : null; },
-  get cameraMode() { return cam.mode; },
-  get paused() { return !!player.paused; },
-  get playbackSpeed() { return speed; },
-  setFrameHook(fn) {
-    if (fn != null && typeof fn !== 'function') throw new TypeError('フレームフックは関数またはnullを指定してください');
-    extensionFrameHook = fn || null;
-    return !!extensionFrameHook;
-  },
-  clearFrameHook() { extensionFrameHook = null; },
-  setCameraMode(name) {
-    if (!CAM_MODES.includes(name)) throw new Error('未対応のカメラモードです');
-    cam.mode = name;
-    if (name === 'free') activateFreeCamera();
-    else { freeCamPanel.hidden = true; clearFreeCamMoves(); }
-    ui.camBtn.textContent = `🎥 ${CAM_NAMES[name]}`;
-    cam.shotT = 0;
-    return cam.mode;
-  },
-  setPlaybackSpeed(value) {
-    const v = Number(value);
-    if (!SPEEDS.includes(v)) throw new Error('再生速度は0.5 / 1 / 2 / 4倍から選んでください');
-    setSpeed(v);
-    return speed;
-  },
-  setPaused(value) {
-    if (mode !== 'ride') return false;
-    if (co && co.sim.mode === 'done' && !value) player.pending = 0;
-    player.paused = !!value;
-    refreshPlay();
-    return player.paused;
-  },
-  togglePlayback() {
-    if (mode !== 'ride') return false;
-    togglePlay();
-    return player.paused;
-  },
-  normalize,
-  buildTrack,
-  prepare,
-  Sim,
-  createTrackExportGroup(design = editor.design) {
-    if (!design || !Array.isArray(design.pts) || design.pts.length < 2) throw new Error('書き出すコースがありません');
-    const tr = prepare(design, buildTrack);
-    const look = cleanLook(design.look);
-    const built = buildTrackMeshes(tr, look.rail, false);
-    built.group.name = 'EditedCoasterTrack';
-    return { group: built.group, track: tr };
-  },
-};
-window.__coasterExpansionRuntime = coasterExpansionRuntime;
-installCoasterExpansion(coasterExpansionRuntime, { FIELD, MAX_LEN, randomStroke, polyLen, autoHeights, H_SAMPLES, STARTS });
-

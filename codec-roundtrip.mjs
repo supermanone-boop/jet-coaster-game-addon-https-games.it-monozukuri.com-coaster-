@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict';
+import * as newTrack from './runtime-v6/track.js';
+import * as newCodec from './runtime-v6/codec.js';
+import * as oldTrack from './runtime-v1/track.js';
+import * as oldCodec from './runtime-v1/codec.js';
+const keys=['loop','boost','brake','jump','roll','splash','tunnel','drop'];
+const gm=Array.from({length:128},(_,i)=>({t:keys[i%8],u:i/127}));
+const pts=Array.from({length:20000},(_,i)=>[Math.max(-7999,Math.min(7999,-7000+i*.7)),Math.sin(i/10)*100]);
+const design={mat:1,bar:2,start:3,cars:5,gm,hs:Array(newTrack.H_SAMPLES).fill(100000),pts,look:{rail:1,car:2,rider:3,scene:2,tunnel:7},map:0,pv:1};
+const encoded=newCodec.encode(design), decoded=newCodec.decode(encoded);
+assert.ok(decoded); assert.equal(decoded.pts.length,20000); assert.equal(decoded.gm.length,128); assert.equal(Math.max(...decoded.hs),100000); assert.equal(decoded.mat,1); assert.equal(decoded.bar,2); assert.equal(decoded.start,3);
+newTrack.setCoasterFieldSize(140); const afterShrink=newCodec.decode(encoded); assert.ok(afterShrink); assert.equal(afterShrink.pts.length,20000);
+newTrack.GIMMICKS.tunnel.len=123; assert.equal(newTrack.GIMMICKS.tunnel.len,123); newTrack.GIMMICKS.tunnel.len=30; const loop=newTrack.getCoasterLoopDimensions(); newTrack.setCoasterLoopDimensions(loop.length*1.5,loop.width*1.5); assert.ok(newTrack.getCoasterLoopDimensions().length>loop.length);
+const legacy=oldCodec.encode({mat:1,bar:1,start:0,cars:4,gm:[{t:'boost',u:.45}],hs:Array(oldTrack.H_SAMPLES).fill(32),pts:[[-30,-20],[0,0],[30,20]]});
+const legacyDecoded=newCodec.decode(legacy); assert.ok(legacyDecoded); assert.equal(legacyDecoded.pts.length,3); assert.equal(legacyDecoded.gm.length,1);
+console.log('PASS v6 roundtrip: 20,000 points / 128 gimmicks / 100,000m / survives field shrink; legacy v1 compatible');
