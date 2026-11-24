@@ -4,14 +4,14 @@
 
 export const G = 9.81;
 // 敷地（上から見た図に描ける範囲、m）
-export const FIELD = { x0: -600, x1: 600, z0: -600, z1: 600 };
+export const FIELD = { x0: -70, x1: 70, z0: -48, z1: 48 };
 // 駅：x0 → x1 の向き（右向き）に走る、まっすぐな 24 m
 export const STATION = { x0: -12, x1: 12, z: 38, h: 2.0 };
 export const ST_LEN = STATION.x1 - STATION.x0;
 export const DS = 0.5; // 線路の点の間隔（m）
 export const H_SAMPLES = 96; // 高さの手書きを何点で持つか
 export const H_MIN = 1.0;
-export const H_MAX = Infinity;
+export const H_MAX = 60;
 export const CHUNK = 20; // 線路を何点ずつのかたまりで作るか（10 m。壊れるときの単位）
 export const MIN_R = 3; // 上から見たカーブの最小半径（m）。急なカーブも描いたとおりに作り、物理の結果に任せる（0.1.5 で 6 m、0.1.11 で 3 m。せまいヘアピンを描くと、半径 6 m では外にふくらんだ輪になり、となりの線路とぶつかった）
 export const ST_R = 15.75; // 駅に戻るつなぎ（Dubins 曲線）の半径（m）
@@ -54,6 +54,9 @@ export const MATS = [
   { id: 'steel', name: '鉄製', v: 6.5, l: 3.8, cascade: 3, cost: 10 },
   { id: 'alloy', name: '超合金', v: 10, l: 6.5, cascade: 2, cost: 18 },
 ];
+// 物理の版（1.3.0）。コースの設計（URL・お気に入り）に持たせ、前のコースは前の物理で計算する（前と同じ結果になる）。
+// 1 = 1.2.x まで。2 = 線路・安全バーごとの特性と、大崩壊の判定の直し。新しく作ったコース・直したコースは今の版
+export const PHYS = 2;
 // 安全バー：v = どこまでの浮き上がり（マイナスの G）に耐えるか、l = 横の G、hold = 事故のとき席に残る割合、cost = 1 席あたり（万円）
 export const BARS = [
   { id: 'belt', name: 'ベルトだけ', v: 0.7, l: 1.9, hold: 0.1, cost: 10 },
@@ -73,17 +76,84 @@ export const GIMMICKS = {
   boost: { name: 'ブースター', len: 20, cost: 500, color: '#f8b800' },
   brake: { name: 'ブレーキ', len: 16, cost: 200, color: '#3aa0ff' },
   jump: { name: 'ジャンプ', len: 14, cost: 300, color: '#a14aff' },
+  // ひねり（1.3.0）：まっすぐな所で、横に 1 回転する。URL では番号で持つので、足すときは後ろに足す
+  roll: { name: 'ひねり', len: 34, cost: 700, color: '#20b89a' },
+  splash: { name: '水しぶき', len: 18, cost: 400, color: '#3ab0e8' },
+  tunnel: { name: 'トンネル', len: 30, cost: 600, color: '#8a6a4a' },
+  drop: { name: '垂直落下', len: 48, cost: 1000, color: '#ff7a2a' },
 };
 export const GIMMICK_KEYS = Object.keys(GIMMICKS);
-export const MAX_GIMMICKS = 128; // v10.1: 仕掛けは最大128個
+export const MAX_GIMMICKS = 12; // 1.2.x までは 8
 export const BUDGET = 10000; // 予算（万円）。0.1.10 で上限としては使わなくなった（結果の画面の「建設費」の目安だけ）
-export const MAX_LEN = 5000; // 拡張版：最大 5 km。極端な負荷を避けるため、無制限にはしない
+export const MAX_LEN = 900; // 上から描ける線の長さの上限（m）。予算をなくした代わりに、重さ・URL の長さ・高さの細かさを抑える
 export const BASE_COST = 1000; // 駅と車両の基本（万円）
 export const CAR_COST = 300;
 export const MAX_CARS = 6;
 export const LOOP_LEN = 80; // 宙返りの線路の長さ（m）。高さは約 17 m（時速 70km ほどで入ると、まわりきれる）
 export const LOOP_W = 3.2; // 宙返りの入口と出口の横のずれ（m）
 export const GAP_LEN = 14;
+// ひねり：線路は、レールの上 ROLL_AXIS m の軸のまわりを回る。お客さんの胸はさらに ROLL_RH m 上にあるので、
+// 速く回るほど外へ振られる（逆さまのときは、ぶら下がる重さに上乗せされる）
+export const ROLL_AXIS = 0.9;
+export const ROLL_RH = 0.15;
+// ひねりの回る角度（0〜1 → 0〜2π）。両はしで回る速さが 0 になる形
+export const rollAngle = (t) => (t <= 0 ? 0 : t >= 1 ? 2 * Math.PI : 2 * Math.PI * (t - Math.sin(2 * Math.PI * t) / (2 * Math.PI)));
+// 宙返り・ひねりのように、道をまっすぐに置きかえるしかけ
+const STRAIGHT = { loop: true, roll: true };
+// 置ける所をまっすぐな所に限るしかけ（垂直落下は道をまっすぐにはせず、描いた道に沿って落とす。
+// まっすぐにすると、元の道へ戻るつなぎ目が急なカーブになり、落ちた直後の速さで折れた）
+const NEED_STRAIGHT = { loop: true, roll: true, drop: true };
+// 水しぶき：線路がこの高さ（m）より低い所では、水の溝に突っ込む（大きく減速）。高い所では、水のカーテンをくぐる（1.2.10。
+// 1.2.9 までは、置くと線路を地面すれすれまで下ろしていたが、たくさん置くと低いコースばかりになった。オーナーの指摘）
+export const SPLASH_LOW = 2.5;
+// 垂直落下：てっぺんで止まる平らな所の長さ（m。車両 6 両がのる）、落ちたあとの高さ、引き起こしの G のめやす
+export const HOLD_LEN = 18;
+export const DROP_BOTTOM = 2;
+export const DROP_MIN_TOP = 25; // てっぺんは少なくともこの高さ（低い所に置いても、巻き上げてから落とす）
+export const DROP_RAMP = 36; // てっぺんの手前の巻き上げの坂の長さ（m）
+export const DROP_TURN = 1.6; // 置ける所：落ちる所の前後で、向きがこれ（ラジアン）より変わらない
+// ふつうの形：落ち始めは半径 18 m、最大 85 度、引き起こし約 4 G
+const DROP_G = 4.0;
+// 高い所（落差が足りるとき）だけ、垂直を越えて 100 度で内側にえぐれて落ちる（自分で描く高さでは作れない形。1.2.19）。
+// 落ち始めを半径 12 m、引き起こしを約 4.5 G に詰めて収める。後ろの車両は強く浮く（約 −2.4 G。安全バーでは飛ばされる）
+const BEYOND = { r1: 12, g: 4.5, angle: 100 };
+// 垂直落下の形：てっぺんから下へ dh m。[前へ進む量, 下がった量（負）] を、道の上の長さ GIMMICKS.drop.len に収める。
+// てっぺんから落ち始め、角度 A までまわってまっすぐ落ち、引き起こしは落ちた速さで約 G になる半径で回る。
+// 落差が足りれば BEYOND（垂直を越える）、足りなければふつうの形（足りなければ角度を浅くして収める）
+export function dropShape(dh) {
+  const fit = (r1, g, deg) => {
+    const R2 = Math.max(8, (2 * dh * 0.92) / (g - 1));
+    const A = (deg * Math.PI) / 180;
+    return { r1, R2, A, ok: (r1 + R2) * (1 - Math.cos(A)) <= dh };
+  };
+  let { r1, R2, A, ok } = fit(BEYOND.r1, BEYOND.g, BEYOND.angle);
+  const beyond = ok;
+  if (!ok) {
+    ({ r1, R2, A } = fit(18, DROP_G, 85));
+    if ((r1 + R2) * (1 - Math.cos(A)) > dh) A = Math.acos(Math.max(-1, 1 - dh / (r1 + R2)));
+  }
+  const Lv = Math.max(0, (dh - (r1 + R2) * (1 - Math.cos(A))) / Math.max(0.05, Math.sin(A)));
+  const pts = [[0, 0]];
+  let x = 0;
+  let y = 0;
+  const step = 0.25;
+  const seg = (len, ang) => {
+    const n = Math.max(1, Math.ceil(len / step));
+    for (let k = 0; k < n; k++) {
+      const a = ang((k + 0.5) / n);
+      x += (Math.cos(a) * len) / n;
+      y += (Math.sin(a) * len) / n;
+      pts.push([x, y]);
+    }
+  };
+  seg(r1 * A, (t) => -A * t);
+  seg(Lv, () => -A);
+  seg(R2 * A, (t) => -A * (1 - t));
+  const adv = GIMMICKS.drop.len;
+  // 余った所は下の平らな所
+  if (x < adv) seg(adv - x, () => 0);
+  return { pts, adv: x, r2: R2, beyond };
+}
 export const JUMP_KICK = 1.82; // 踏み切り台の高さ（10 m で 20 度まで起き上がる）
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
@@ -447,7 +517,7 @@ export function placeGimmicks(design, Lf, path = null) {
   let prevEnd = lead;
   for (const g of list) {
     const len = g.t === 'loop' ? loopShape().adv : GIMMICKS[g.t].len;
-    const pad = g.t === 'loop' ? 32 : g.t === 'jump' ? 18 : 4;
+    const pad = g.t === 'loop' ? 32 : g.t === 'roll' ? 24 : g.t === 'drop' ? HOLD_LEN + DROP_RAMP : g.t === 'jump' ? 18 : g.t === 'tunnel' || g.t === 'splash' ? 12 : 4;
     const s0 = g.u * Lf;
     const e = { t: g.t, s0, s1: s0 + len, u: g.u, ok: false, why: '' };
     out.push(e);
@@ -460,9 +530,10 @@ export function placeGimmicks(design, Lf, path = null) {
       continue;
     }
     // ジャンプはカーブの上にも置ける（空中はまっすぐ飛ぶので、カーブだと着地できずに事故になる。それも物理に任せる。0.1.14）
-    if (path && g.t === 'loop') {
-      const turn = turnOf(path, s0 - 10, s0 + len + 10);
-      if (turn > 1.1) {
+    if (path && NEED_STRAIGHT[g.t]) {
+      // 垂直落下は、落ちる所の形が縦の面にあるだけなので、宙返り・ひねりより少しカーブがあってもよい
+      const turn = g.t === 'drop' ? turnOf(path, s0 - 6, s0 + len + 6) : turnOf(path, s0 - 10, s0 + len + 10);
+      if (turn > (g.t === 'drop' ? DROP_TURN : 1.1)) {
         e.why = 'curve';
         continue;
       }
@@ -534,7 +605,7 @@ export function buildTrack(design, vEst = null) {
   const LOOP_LEAD = 40;
   const straights = [];
   for (const g of gms) {
-    if (g.t !== 'loop') continue;
+    if (!STRAIGHT[g.t]) continue;
     const a = Math.max(0, g.s0 - LOOP_LEAD);
     const b = Math.min(Lf, g.s1 + LOOP_LEAD);
     const A = at0(a);
@@ -607,6 +678,47 @@ export function buildTrack(design, vEst = null) {
       }
     }
   }
+  // ひねりは、その区間の平均の高さで平らにする（丘の上でもよい。登り下りしながら回ると、形が崩れる）
+  for (const g of gms) {
+    if (g.t !== 'roll') continue;
+    let sum = 0;
+    let c = 0;
+    for (let i = Math.max(0, Math.floor(g.s0)); i <= Math.min(nh - 1, Math.ceil(g.s1)); i++) {
+      sum += hgt[i];
+      c++;
+    }
+    const hb = Math.max(1.5, sum / (c || 1));
+    const L0 = 24;
+    for (let i = Math.max(0, Math.floor(g.s0 - L0)); i <= Math.min(nh - 1, Math.ceil(g.s1 + L0)); i++) {
+      const w = i < g.s0 ? 1 - smooth01((i - (g.s0 - L0)) / 16) : i > g.s1 ? smooth01((i - g.s1 - 8) / 16) : 0;
+      hgt[i] = hb + (hgt[i] - hb) * w;
+    }
+  }
+  // 高さの差に合わせた坂の長さ（急に上げ下げすると、谷で G が大きすぎる）
+  const lowBlend = (dh) => Math.min(120, 16 + 2.2 * Math.abs(dh));
+  // 垂直落下：手前を、その所までのいちばん高い高さで平らにし（てっぺんで止まる所）、落ちた先を低くする
+  for (const g of gms) {
+    if (g.t !== 'drop') continue;
+    let top = DROP_MIN_TOP;
+    for (let i = Math.max(0, Math.floor(g.s0 - HOLD_LEN)); i <= Math.min(nh - 1, Math.ceil(g.s0)); i++) top = Math.max(top, hgt[i]);
+    top = Math.min(top, H_MAX);
+    g.top = top;
+    const dOut = hgt[Math.max(0, Math.min(nh - 1, Math.round(g.s1 + 10)))] - DROP_BOTTOM;
+    const Lo = lowBlend(dOut);
+    // 道の上の位置で、てっぺんは ceil(s0) まで、落ちた先は ceil(s0) の次から（hAt が s0 の前後で両方を混ぜないように）
+    const e0 = Math.ceil(g.s0);
+    // 手前は DROP_RAMP m の坂で、てっぺんまで巻き上げる
+    for (let i = Math.max(0, Math.floor(g.s0 - HOLD_LEN - DROP_RAMP)); i <= Math.min(nh - 1, Math.ceil(g.s1 + 20 + Lo)); i++) {
+      if (i <= e0) {
+        const w = 1 - smooth01((i - (g.s0 - HOLD_LEN - DROP_RAMP)) / DROP_RAMP);
+        hgt[i] = top + (hgt[i] - top) * w;
+      } else if (i < g.s1 + 20) hgt[i] = DROP_BOTTOM;
+      else {
+        const w = smooth01((i - g.s1 - 20) / Lo);
+        hgt[i] = DROP_BOTTOM + (hgt[i] - DROP_BOTTOM) * w;
+      }
+    }
+  }
   // 発射の区間は平らにしておく（ならしたあとにもう一度平らにする）
   const launchLen = design.start > 0 ? 30 : 0;
   for (let i = 0; i <= Math.min(nh - 1, launchLen); i++) hgt[i] = H0;
@@ -635,13 +747,29 @@ export function buildTrack(design, vEst = null) {
     }
     hgt = q;
   }
-  // 宙返りの入口と出口は、ならした後にもう一度ぴったり平らにする
+  // 宙返り・ひねりの入口と出口は、ならした後にもう一度ぴったり平らにする
   for (const g of gms) {
-    if (g.t !== 'loop') continue;
+    if (!STRAIGHT[g.t]) continue;
     const hb = hgt[Math.round(g.s0)];
     for (let i = Math.max(0, Math.floor(g.s0 - 16)); i <= Math.min(nh - 1, Math.ceil(g.s1 + 16)); i++) {
       const w = i < g.s0 - 4 ? 1 - smooth01((i - (g.s0 - 16)) / 12) : i > g.s1 + 4 ? smooth01((i - g.s1 - 4) / 12) : 0;
       hgt[i] = hb + (hgt[i] - hb) * w;
+    }
+  }
+  // 垂直落下も、ならした後にもう一度ぴったり平らにする
+  for (const g of gms) {
+    if (g.t === 'drop') {
+      const top = g.top;
+      const e0 = Math.ceil(g.s0);
+      // 落ちた先から、もとの高さへ戻る坂は、高さの差に合わせて長くする（短いと、速いまま谷の底で G が大きすぎる）
+      let up = 0;
+      for (let i = Math.ceil(g.s1); i <= Math.min(nh - 1, Math.ceil(g.s1 + 60)); i++) up = Math.max(up, hgt[i] - DROP_BOTTOM);
+      const Lp = Math.max(24, lowBlend(up));
+      for (let i = Math.max(0, Math.floor(g.s0 - HOLD_LEN - 10)); i <= Math.min(nh - 1, Math.ceil(g.s1 + 6 + Lp)); i++) {
+        if (i <= e0) hgt[i] = top + (hgt[i] - top) * (1 - smooth01((i - (g.s0 - HOLD_LEN - 10)) / 10));
+        else if (i < g.s1 + 6) hgt[i] = DROP_BOTTOM;
+        else hgt[i] = DROP_BOTTOM + (hgt[i] - DROP_BOTTOM) * smooth01((i - g.s1 - 6) / Lp);
+      }
     }
   }
   // 駅の前後は駅の高さにつなぐ。発射のときは、発射の区間を平らにする
@@ -688,7 +816,15 @@ export function buildTrack(design, vEst = null) {
         if (g.t === 'boost') f |= F.BOOST;
         else if (g.t === 'brake') f |= F.BRAKE;
         else if (g.t === 'jump') f |= F.GAP;
+        else if (g.t === 'roll') f |= F.ROLL;
+        else if (g.t === 'splash') f |= F.SPLASH;
+        else if (g.t === 'tunnel') f |= F.TUNNEL;
       }
+      if (g.t === 'drop' && s >= g.s0 - HOLD_LEN + 2 && s < g.s0) f |= F.HOLD;
+      // 落ちる縁（ここで止める）
+      if (g.t === 'drop' && s >= g.s0 - 1.5 && s < g.s0) f |= F.EDGE;
+      // 垂直落下の手前の坂は巻き上げ（遅くても、てっぺんまで引き上げる）
+      if (g.t === 'drop' && s >= g.s0 - HOLD_LEN - DROP_RAMP && s < g.s0 - HOLD_LEN + 4) f |= F.LIFT;
     }
     return f;
   };
@@ -706,6 +842,8 @@ export function buildTrack(design, vEst = null) {
     return 0;
   };
   const loopAt = (s) => gms.find((g) => g.t === 'loop' && s >= g.s0 && s < g.s1);
+  const rollAt = (s) => gms.find((g) => g.t === 'roll' && s >= g.s0 && s < g.s1);
+  const dropAt = (s) => gms.find((g) => g.t === 'drop' && s >= g.s0 && s < g.s1);
   const LS = loopShape();
   for (let s = 0; s < Lf; s += 0.5) {
     const lp = loopAt(s);
@@ -725,8 +863,31 @@ export function buildTrack(design, vEst = null) {
       s = lp.s1;
       continue;
     }
+    const dp = dropAt(s);
+    if (dp) {
+      // 垂直落下：形の点を、道の向きに沿って置く
+      const top = dp.top;
+      const DS_ = dropShape(Math.max(1, top - DROP_BOTTOM));
+      dp.beyond = DS_.beyond;
+      const sc = (dp.s1 - dp.s0) / DS_.adv;
+      for (let k = 1; k < DS_.pts.length; k++) {
+        const [fx, fy] = DS_.pts[k];
+        const q = at2(dp.s0 + fx * sc);
+        dense.push([q.x, top + fy, q.z, F.DROP]);
+      }
+      s = dp.s1;
+      continue;
+    }
     const a = at2(s);
     const lat = latOf(s);
+    const rl = rollAt(s);
+    if (rl) {
+      // ひねり：レールは、軸（レールの上 ROLL_AXIS m）のまわりを右回りに回る。7 番目に回った角度
+      const th = rollAngle((s - rl.s0) / (rl.s1 - rl.s0));
+      const off = -ROLL_AXIS * Math.sin(th);
+      dense.push([a.x - a.dz * off, hAt(s) + ROLL_AXIS * (1 - Math.cos(th)), a.z + a.dx * off, zoneOf(s), 0, 0, th]);
+      continue;
+    }
     dense.push([a.x - a.dz * lat, hAt(s), a.z + a.dx * lat, zoneOf(s)]);
   }
   // 3D の長さで DS ごとに打ち直す（閉じた輪）
@@ -750,6 +911,7 @@ export function buildTrack(design, vEst = null) {
     kx: new Float64Array(n), ky: new Float64Array(n), kz: new Float64Array(n),
     bank: new Float64Array(n),
     lrx: new Float32Array(n), lrz: new Float32Array(n), // 宙返りの中の右向き（輪の面に垂直）
+    roll: new Float32Array(n), rollRate: new Float32Array(n), // ひねりの回った角度・1 m あたりに回る角度
     fl: new Uint16Array(n),
     gms, design,
   };
@@ -769,6 +931,8 @@ export function buildTrack(design, vEst = null) {
       tr.lrx[i] = near[4];
       tr.lrz[i] = near[5];
     }
+    if (a[3] & b[3] & F.ROLL) tr.roll[i] = a[6] + (b[6] - a[6]) * t;
+    else if (near[3] & F.ROLL) tr.roll[i] = near[6];
   }
   tr.stEnd = Math.round(ST_LEN / (DS * k)); // 駅の終わりの点
   for (let i = 0; i < tr.stEnd; i++) tr.fl[i] |= F.STATION;
@@ -817,6 +981,15 @@ export function buildTrack(design, vEst = null) {
     tr.ky[i] = y - d * tr.ty[i];
     tr.kz[i] = z - d * tr.tz[i];
   }
+  // ひねりの中：お客さんが通るのは軸のそばのまっすぐな線なので、レールのらせんの曲がり方は使わない。
+  // 代わりに回る速さ（1 m あたりの角度）を持ち、物理で外へ振られる力にする
+  for (let i = 0; i < n; i++) {
+    if (!(tr.fl[i] & F.ROLL)) continue;
+    tr.kx[i] = tr.ky[i] = tr.kz[i] = 0;
+    const a = wrap(i - 1);
+    const b = wrap(i + 1);
+    if (tr.fl[a] & tr.fl[b] & F.ROLL) tr.rollRate[i] = Math.max(0, (tr.roll[b] - tr.roll[a]) / (2 * DS));
+  }
   // リフト（最初の山のてっぺんまで）
   tr.liftEnd = -1;
   if (design.start === 0) {
@@ -846,7 +1019,7 @@ export function buildTrack(design, vEst = null) {
   return tr;
 }
 
-export const F = { STATION: 1, LIFT: 2, LAUNCH: 4, BOOST: 8, BRAKE: 16, GAP: 32, LOOP: 64, CLASH: 128 };
+export const F = { STATION: 1, LIFT: 2, LAUNCH: 4, BOOST: 8, BRAKE: 16, GAP: 32, LOOP: 64, CLASH: 128, ROLL: 256, SPLASH: 512, TUNNEL: 1024, HOLD: 2048, DROP: 4096, EDGE: 8192 };
 
 // 向き（上・右）。ふつうは空の向きを上にしてカーブで内側に傾け、宙返り・垂直に近い所は前の点からつなぐ
 function computeFrames(tr, vEst) {
@@ -857,7 +1030,7 @@ function computeFrames(tr, vEst) {
     const tx = tr.tx[i];
     const ty = tr.ty[i];
     const tz = tr.tz[i];
-    if (!vEst || (tr.fl[i] & (F.LOOP | F.STATION)) || Math.abs(ty) > 0.85) continue;
+    if (!vEst || (tr.fl[i] & (F.LOOP | F.ROLL | F.STATION)) || Math.abs(ty) > 0.85) continue;
     // 空の向きを接線に垂直に
     let ux = -ty * tx;
     let uy = 1 - ty * ty;
@@ -888,17 +1061,18 @@ function computeFrames(tr, vEst) {
       bank[i] = s / (2 * W + 1);
     }
   }
-  for (let i = 0; i < n; i++) if (tr.fl[i] & (F.LOOP | F.STATION)) bank[i] = 0;
-  // 宙返りの前後 8 m は、傾きを 0 に戻しておく（傾いたまま輪に入ると、輪の中で横の G がかかる）
+  for (let i = 0; i < n; i++) if (tr.fl[i] & (F.LOOP | F.ROLL | F.STATION)) bank[i] = 0;
+  // 宙返り・ひねりの前後 8 m は、傾きを 0 に戻しておく（傾いたまま輪に入ると、輪の中で横の G がかかる）
   const R0 = Math.round(8 / DS);
+  const ST = F.LOOP | F.ROLL;
   for (let i = 0; i < n; i++) {
-    if (!(tr.fl[i] & F.LOOP)) continue;
+    if (!(tr.fl[i] & ST)) continue;
     for (let q = 1; q <= R0; q++) {
       const k = smooth01(q / R0);
       const a = tr.wrap(i - q);
       const b = tr.wrap(i + q);
-      if (!(tr.fl[a] & F.LOOP)) bank[a] *= k;
-      if (!(tr.fl[b] & F.LOOP)) bank[b] *= k;
+      if (!(tr.fl[a] & ST)) bank[a] *= k;
+      if (!(tr.fl[b] & ST)) bank[b] *= k;
     }
   }
   tr.bank = bank;
@@ -934,6 +1108,25 @@ function computeFrames(tr, vEst) {
       ax /= l;
       ay /= l;
       az /= l;
+    }
+    if (tr.fl[i] & F.ROLL) {
+      // ひねりの中：空の向きを、接線のまわりに回った角度だけ回す
+      let ux = -ty * tx;
+      let uy = 1 - ty * ty;
+      let uz = -ty * tz;
+      l = Math.hypot(ux, uy, uz) || 1;
+      ux /= l;
+      uy /= l;
+      uz /= l;
+      const rx = ty * uz - tz * uy;
+      const ry = tz * ux - tx * uz;
+      const rz = tx * uy - ty * ux;
+      const c = Math.cos(tr.roll[i]);
+      const s = Math.sin(tr.roll[i]);
+      ax = ux * c + rx * s;
+      ay = uy * c + ry * s;
+      az = uz * c + rz * s;
+      w = 0;
     }
     if (w > 0) {
       // 空の向き + バンク
@@ -1027,20 +1220,16 @@ function makeChunks(tr) {
 }
 export const chunkOf = (i) => Math.floor(i / CHUNK);
 
-// 支柱。低い区間は密に、高い区間は間隔を広げる（高架でメッシュが爆発するのを防ぐ）。
+// 支柱（6 m ごと。線路が上を向いている所だけ）
 function makeSupports(tr) {
   tr.supports = [];
-  let nextAt = 0;
-  for (let i = 0; i < tr.n; i++) {
+  const step = Math.round(6 / DS);
+  for (let i = 0; i < tr.n; i += step) {
     if (tr.fl[i] & (F.STATION | F.GAP)) continue;
     if (tr.uy[i] < 0.45) continue;
-    const y = Math.max(0, tr.py[i] - tr.uy[i] * 0.55);
-    if (y < 0.6 || i < nextAt) continue;
-    // 高さに応じて 6 / 10 / 16 / 24 / 36 / 48 m 間隔。
-    // 600 m 級以上で全区間を 6 m 間隔にすると、木製支柱の補強材が過剰になる。
-    const spacing = y < 30 ? 6 : y < 80 ? 10 : y < 180 ? 16 : y < 350 ? 24 : y < 700 ? 36 : 48;
+    const y = tr.py[i] - tr.uy[i] * 0.55;
+    if (y < 0.6) continue;
     tr.supports.push(i);
-    nextAt = i + Math.max(1, Math.round(spacing / DS));
   }
 }
 

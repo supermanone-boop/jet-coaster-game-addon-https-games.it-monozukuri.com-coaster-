@@ -1,10 +1,10 @@
 // world.js — 遊園地の敷地・線路・車両・お客さん・観客・飛び散るものの 3D の見た目
 // 物理は sim.js が持ち、ここは毎フレームその状態を写すだけ。
 import * as THREE from '../../crowded-train-3d/js/vendor/three.module.min.js';
-import { FIELD, STATION, DS, F, CHUNK, MATS, mapOf, inWater } from './track.js';
+import { FIELD, STATION, DS, F, CHUNK, MATS, mapOf, inWater, rng } from './track.js';
 import { themeLayout } from './themes.js';
 import { riderSeat } from './sim.js';
-import { RAIL_LOOKS, CAR_LOOKS } from './looks.js';
+import { RAIL_LOOKS, CAR_LOOKS, TUNNEL_LOOKS } from './looks.js';
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const colorCache = new Map();
@@ -109,6 +109,15 @@ class Builder {
     s = norm(s);
     const u = cross(s, d);
     this.tube([[...a, ...u, ...s], [...b, ...u, ...s]], r, color, seg);
+  }
+  // 4 点 a→b→c→d の面（両面）。n は表の向き
+  quad(a, b, c, d, n, color) {
+    const cl = col(color);
+    for (const sg of [1, -1]) {
+      const base = this.count;
+      for (const p of sg > 0 ? [a, b, c, d] : [a, d, c, b]) this.vert(p[0], p[1], p[2], n[0] * sg, n[1] * sg, n[2] * sg, cl);
+      this.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    }
   }
   geometry() {
     const g = new THREE.BufferGeometry();
@@ -983,9 +992,8 @@ export function buildPark(sceneId = 'day', mapId = 0) {
   const M = mapOf(mapId);
   const g = new THREE.Group();
   // 地面：芝（刈り目のしま）・駅前の広場・園路
-  // 拡張版では敷地に合わせて地面を広げる。テクスチャ解像度は端末負荷を抑えて固定に近づける。
-  const S = Math.max(320, Math.ceil(Math.max(FIELD.x1 - FIELD.x0, FIELD.z1 - FIELD.z0) + 80));
-  const PX = S > 500 ? 0.75 : 3; // 1m あたりのピクセル
+  const S = 320;
+  const PX = 3; // 1m あたりのピクセル
   const tex = canvasTex(S * PX / 2, S * PX / 2, (x, w, h) => {
     const k = w / S;
     x.fillStyle = S0.grass[0];
@@ -1159,8 +1167,7 @@ export function buildPark(sceneId = 'day', mapId = 0) {
   // 空と山（遠景の円柱に描く）
   // 円柱の周り（約 1630 m）に貼るので横に引きのばされる。丸い物（月・太陽）は横を縮めて描く
   const SW = S0.stars ? 2048 : 1024;
-  const SKY_RADIUS = Math.max(260, (FIELD.x1 - FIELD.x0) * 1.4);
-  const sq = (w) => (140 / 256) / ((2 * Math.PI * SKY_RADIUS) / w);
+  const sq = (w) => (140 / 256) / ((2 * Math.PI * 260) / w);
   const skyTex = canvasTex(SW, 256, (x, w, h) => {
     const gr = x.createLinearGradient(0, 0, 0, h);
     for (const [t, c] of S0.sky) gr.addColorStop(t, c);
@@ -1261,7 +1268,7 @@ export function buildPark(sceneId = 'day', mapId = 0) {
     }
   });
   skyTex.wrapS = THREE.RepeatWrapping;
-  const sky = new THREE.Mesh(new THREE.CylinderGeometry(SKY_RADIUS, SKY_RADIUS, 140, 64, 1, true), new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide, fog: false }));
+  const sky = new THREE.Mesh(new THREE.CylinderGeometry(260, 260, 140, 32, 1, true), new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide, fog: false }));
   sky.position.y = 55;
   g.add(sky);
   return g;
@@ -1420,7 +1427,8 @@ function glowPoints(pos, colr, size) {
 }
 // 線路をかたまり（10 m）ごとのメッシュにする。支点（真下の地面）を原点にしたので、そのまま倒せる
 // rail：装飾の線路の色（looks.js の RAIL_LOOKS の番号。0 は素材ごとの色）
-export function buildTrackMeshes(tr, rail = 0, night = false) {
+// tunnel：トンネルの見た目（looks.js の TUNNEL_LOOKS の番号。0 は今までの見た目）
+export function buildTrackMeshes(tr, rail = 0, night = false, tunnel = 0) {
   const mat = MATS[tr.design.mat].id;
   const pick = RAIL_LOOKS[rail];
   const lk = pick && pick.rail ? { ...pick, spine: LOOK[mat].spine ? pick.spine : null } : LOOK[mat];
@@ -1524,17 +1532,14 @@ export function buildTrackMeshes(tr, rail = 0, night = false) {
         const l = Math.hypot(rx, rz) || 1;
         rx /= l;
         rz /= l;
-        // 高架は基部を広くしたテーパー支柱にする。幅と補強材数を上限付きにし、
-        // 600 m 級のコースでも数十万本の小さな梁を生成しない。
-        const w = Math.min(14, 0.7 + y * 0.022);
+        const w = 0.7 + y * 0.06;
         const A = [top[0] - rx * w, 0, top[2] - rz * w];
         const B = [top[0] + rx * w, 0, top[2] + rz * w];
         const At = [top[0] - rx * 0.6, y, top[2] - rz * 0.6];
         const Bt = [top[0] + rx * 0.6, y, top[2] + rz * 0.6];
         b.beam(A, At, 0.22, 0.22, lk.sup);
         b.beam(B, Bt, 0.22, 0.22, lk.sup);
-        const bracePitch = y > 300 ? 30 : y > 100 ? 18 : y > 45 ? 9 : 3;
-        const steps = Math.max(1, Math.min(24, Math.ceil(y / bracePitch)));
+        const steps = Math.max(1, Math.floor(y / 3));
         for (let k = 1; k <= steps; k++) {
           const f0 = (k - 1) / steps;
           const f1 = k / steps;
@@ -1569,6 +1574,61 @@ export function buildTrackMeshes(tr, rail = 0, night = false) {
     group.add(mesh);
     meshes.push(mesh);
   }
+  // 水しぶきの溝・トンネル（1.3.0）。地面に置く建物なので、かたまり（崩れる線路）とは別の 1 つの形にする
+  const deco = new Builder();
+  const runsOf = (flag) => {
+    const out = [];
+    let cur = null;
+    for (let i = 0; i < tr.n; i++) {
+      if (tr.fl[i] & flag) {
+        if (!cur) cur = [];
+        cur.push(i);
+      } else if (cur) {
+        out.push(cur);
+        cur = null;
+      }
+    }
+    if (cur) out.push(cur);
+    return out;
+  };
+  // 横向き（水平にした右）と向き
+  const flat = (j) => {
+    let rx = tr.rx[j];
+    let rz = tr.rz[j];
+    const l = Math.hypot(rx, rz) || 1;
+    return { rx: rx / l, rz: rz / l, tx: -rz / l, tz: rx / l };
+  };
+  const LOWY = 2.5; // 水しぶき：これより低い所は水の溝、高い所は水のカーテンの噴き出し口
+  for (const run of runsOf(F.SPLASH)) {
+    const ext = 10; // 前後に少しはみ出す
+    for (let k = -ext; k < run.length + ext; k += 2) {
+      const j = tr.wrap(run[0] + k);
+      const f = flat(j);
+      const x = tr.px[j];
+      const z = tr.pz[j];
+      const half = [f.tx * 0.55, 0, f.tz * 0.55];
+      if (tr.py[j] < LOWY) {
+        // 線路の通る池：広い水面と、岩のふち（突っ込む所がひと目で分かるように）
+        deco.box(x, 0.62, z, half, [0, 0.06, 0], [f.rx * 5, 0, f.rz * 5], k % 4 ? '#3aa8e0' : '#5ac0f0');
+        deco.box(x, 0.3, z, half, [0, 0.3, 0], [f.rx * 5.1, 0, f.rz * 5.1], '#2a6a98');
+        for (const sd of [-5.4, 5.4]) deco.box(x + f.rx * sd, 0.55, z + f.rz * sd, half, [0, 0.55 + ((k >> 1) % 3) * 0.15, 0], [f.rx * 0.5, 0, f.rz * 0.5], (k >> 1) % 2 ? '#8a8478' : '#9a9488');
+      } else if (k >= 0 && k < run.length && k % 4 === 0) {
+        // 水のカーテン：線路の両わきに、水色の管と内向きの噴き出し口
+        const P2 = (du, dr) => [tr.px[j] + tr.ux[j] * du + tr.rx[j] * dr, tr.py[j] + tr.uy[j] * du + tr.ry[j] * dr, tr.pz[j] + tr.uz[j] * du + tr.rz[j] * dr];
+        const t = [tr.tx[j] * 1.05, tr.ty[j] * 1.05, tr.tz[j] * 1.05];
+        for (const sd of [-1, 1]) {
+          const a = P2(-0.3, sd * 1.5);
+          deco.box(a[0], a[1], a[2], t, [tr.ux[j] * 0.09, tr.uy[j] * 0.09, tr.uz[j] * 0.09], [tr.rx[j] * 0.09, tr.ry[j] * 0.09, tr.rz[j] * 0.09], '#4ab0e0');
+          const q = P2(-0.1, sd * 1.4);
+          deco.box(q[0], q[1], q[2], [tr.tx[j] * 0.12, tr.ty[j] * 0.12, tr.tz[j] * 0.12], [tr.ux[j] * 0.16, tr.uy[j] * 0.16, tr.uz[j] * 0.16], [tr.rx[j] * 0.12, tr.ry[j] * 0.12, tr.rz[j] * 0.12], '#d8e8f0');
+        }
+      }
+    }
+  }
+  const glass = new Builder();
+  for (const run of runsOf(F.TUNNEL)) buildTunnel(deco, glass, tr, run, flat, tunnel);
+  if (glass.count) group.add(new THREE.Mesh(glass.geometry(), GLASS));
+  if (deco.count) group.add(new THREE.Mesh(deco.geometry(), VC));
   let bulbs = null;
   if (bl.length) {
     const pts = glowPoints(bl, bcol, 1.1);
@@ -1576,6 +1636,183 @@ export function buildTrackMeshes(tr, rail = 0, night = false) {
     bulbs = { points: pts, local: new Float32Array(bl), ci: bci };
   }
   return { group, meshes, bulbs };
+}
+// ---------------- トンネル ----------------
+// ガラスのトンネルの面（すける。中から外の景色が見える）
+const GLASS = new THREE.MeshLambertMaterial({ vertexColors: true, transparent: true, opacity: 0.28, depthWrite: false, side: THREE.DoubleSide });
+// 見た目ごとの色。in：中（壁・天井・床。1 色だけ。速く走ると、しま模様や明るさの差が点滅に見えるため）、
+// out・out2：外側（となりの 1 m と交互。外から見るだけなので模様にしてよい）、rim：入口・出口の枠
+const TUNNEL_STYLES = {
+  brick: { in: '#7a4436', out: '#b8553e', out2: '#a64a36', rim: '#e8dcc0' },
+  castle: { in: '#6a6a72', out: '#8e8e96', out2: '#828290', rim: '#9a9aa2' },
+  rock: { in: '#5a5048', out: '#7a6e62', out2: '#7a6e62', rim: '#8a7e70' },
+  glass: { in: '#bfe8ff', rim: '#f4f4f8' },
+  monster: { in: '#8a2a3a', out: '#4a9a3a', out2: '#44903a', rim: '#3a7a2e' },
+  ice: { in: '#9ad4f0', out: '#d8f2ff', out2: '#cceeff', rim: '#eaf8ff' },
+  candy: { in: '#ffd6e6', out: '#ff9ac0', out2: '#ff8ab6', rim: '#ffffff' },
+};
+const SPRINKLES = ['#e8384f', '#f8d040', '#3a8ae8', '#4ac060', '#ffffff', '#9a5ad8'];
+function buildTunnel(deco, glass, tr, run, flat, look) {
+  const id = TUNNEL_LOOKS[look]?.id || 'auto';
+  const W2 = 1.92; // 中の壁（線路の中心から横へ）
+  const TOP = 3.7; // 天井（線路から上へ）
+  const BOT = -0.75; // 床
+  const SH = 0.15; // 外側の殻の厚み（中の面と離して、重ならないように）
+  const Q = (jj, du, dr, dt = 0) => [
+    tr.px[jj] + tr.ux[jj] * du + tr.rx[jj] * dr + tr.tx[jj] * dt,
+    tr.py[jj] + tr.uy[jj] * du + tr.ry[jj] * dr + tr.ty[jj] * dt,
+    tr.pz[jj] + tr.uz[jj] * du + tr.rz[jj] * dr + tr.tz[jj] * dt,
+  ];
+  const V = (jj, a, s) => (a === 't' ? [tr.tx[jj] * s, tr.ty[jj] * s, tr.tz[jj] * s] : a === 'u' ? [tr.ux[jj] * s, tr.uy[jj] * s, tr.uz[jj] * s] : [tr.rx[jj] * s, tr.ry[jj] * s, tr.rz[jj] * s]);
+  // 線路の向きに沿った箱（中心は Q の座標、lt・lu・lr は向き・上・横の半分の大きさ）
+  const bx = (jj, du, dr, dt, lt, lu, lr, c) => {
+    const p = Q(jj, du, dr, dt);
+    deco.box(p[0], p[1], p[2], V(jj, 't', lt), V(jj, 'u', lu), V(jj, 'r', lr), c);
+  };
+  const r = rng(run[0] * 7 + 13);
+  const st = TUNNEL_STYLES[id];
+  for (let k = 0; k < run.length; k += 2) {
+    const j = tr.wrap(run[k]);
+    const end = k < 2 || k >= run.length - 2;
+    const enter = k < 2; // 入口（外の面は進む向きの逆）
+    const low = tr.py[j] < 3;
+    const L = end ? 0.7 : 0.68; // となりと重ねる（カーブの外側にすき間ができないように）
+    const j2 = k + 2 < run.length ? tr.wrap(run[k + 2]) : -1;
+    const m = (k >> 1) % 2; // 1 m ごとの交互（外側の模様）
+    if (id === 'auto') {
+      // 今までの見た目（1.3.0〜）
+      const c = end ? '#6a5848' : '#7e6e5e';
+      if (end) {
+        for (const sd of [-2.1, 2.1]) bx(j, 1.5, sd, 0, L, 2.2, 0.35, c);
+        bx(j, 3.9, 0, 0, L, 0.4, 2.6, c);
+      }
+      if (j2 >= 0) {
+        for (const sd of [-1, 1]) deco.quad(Q(j, BOT, sd * W2), Q(j2, BOT, sd * W2), Q(j2, TOP, sd * W2), Q(j, TOP, sd * W2), V(j, 'r', -sd), c);
+        deco.quad(Q(j, TOP, -W2), Q(j2, TOP, -W2), Q(j2, TOP, W2), Q(j, TOP, W2), V(j, 'u', -1), c);
+        if (!low) deco.quad(Q(j, BOT, -W2), Q(j2, BOT, -W2), Q(j2, BOT, W2), Q(j, BOT, W2), V(j, 'u', 1), c);
+      }
+      if (low && !end) {
+        const x = tr.px[j];
+        const z = tr.pz[j];
+        const f = flat(j);
+        const rr = Q(j, 3.7, 0);
+        const top = rr[1] + 0.35;
+        deco.box(rr[0], top, rr[2], [f.tx * 0.55, 0, f.tz * 0.55], [0, 0.08, 0], [f.rx * 2.4, 0, f.rz * 2.4], '#5aa848');
+        for (const sd of [-1, 1]) deco.beam([x + f.rx * sd * 2.4, top, z + f.rz * sd * 2.4], [x + f.rx * sd * 6.4, 0.05, z + f.rz * sd * 6.4], 1.2, 0.5, (k >> 1) % 2 ? '#5aa848' : '#52a042');
+      }
+      continue;
+    }
+    // 中の面（1 色）と外側の殻
+    if (j2 >= 0) {
+      const B = id === 'glass' ? glass : deco;
+      for (const sd of [-1, 1]) B.quad(Q(j, BOT, sd * W2), Q(j2, BOT, sd * W2), Q(j2, TOP, sd * W2), Q(j, TOP, sd * W2), V(j, 'r', -sd), st.in);
+      B.quad(Q(j, TOP, -W2), Q(j2, TOP, -W2), Q(j2, TOP, W2), Q(j, TOP, W2), V(j, 'u', -1), st.in);
+      if (!low) B.quad(Q(j, BOT, -W2), Q(j2, BOT, -W2), Q(j2, BOT, W2), Q(j, BOT, W2), V(j, 'u', 1), st.in);
+      if (st.out) {
+        const o = m ? st.out2 : st.out;
+        const W3 = W2 + SH;
+        const T3 = TOP + SH;
+        const B3 = BOT - SH;
+        for (const sd of [-1, 1]) deco.quad(Q(j, B3, sd * W3), Q(j2, B3, sd * W3), Q(j2, T3, sd * W3), Q(j, T3, sd * W3), V(j, 'r', sd), o);
+        deco.quad(Q(j, T3, -W3), Q(j2, T3, -W3), Q(j2, T3, W3), Q(j, T3, W3), V(j, 'u', 1), o);
+        if (!low) deco.quad(Q(j, B3, -W3), Q(j2, B3, -W3), Q(j2, B3, W3), Q(j, B3, W3), V(j, 'u', -1), o);
+      }
+      if (id === 'brick') {
+        // 外側の目地（線路に沿った横の線。外の面から 1 cm 以上離す）
+        for (const sd of [-1, 1]) for (const du of low ? [1.2, 2.5] : [0, 1.2, 2.5]) deco.beam(Q(j, du, sd * (W2 + SH + 0.03)), Q(j2, du, sd * (W2 + SH + 0.03)), 0.04, 0.07, st.rim, [tr.ux[j], tr.uy[j], tr.uz[j]]);
+      }
+      if (id === 'glass') {
+        // 白い骨組みは、線路に沿った 4 本の線だけ（輪を並べると、速く走ったときに点滅して見える）
+        for (const sd of [-1, 1]) for (const du of low ? [TOP] : [TOP, BOT]) deco.beam(Q(j, du, sd * W2), Q(j2, du, sd * W2), 0.14, 0.14, st.rim, [tr.ux[j], tr.uy[j], tr.uz[j]]);
+      }
+    }
+    const fo = enter ? -1 : 1; // 外向き（入口なら手前、出口なら先）
+    if (end) {
+      // 入口・出口の枠（どの見た目にも）
+      for (const sd of [-2.15, 2.15]) bx(j, 1.45, sd, 0, L, 2.3, 0.3, st.rim);
+      bx(j, 3.95, 0, 0, L, 0.35, 2.45, st.rim);
+    }
+    if (id === 'brick') {
+      if (end) bx(j, 4.15, 0, fo * 0.1, L, 0.55, 0.38, '#f4ecd8'); // かなめ石
+    } else if (id === 'castle') {
+      // 屋根の両ふちに、のこぎりの歯のような胸壁（2 m おき）
+      if (!end && k % 4 === 0) for (const sd of [-1, 1]) bx(j, TOP + SH + 0.36, sd * (W2 + 0.02), 0, 0.5, 0.35, 0.2, '#9a9aa2');
+      if (end) {
+        // 両わきの塔と旗
+        for (const sd of [-1, 1]) {
+          bx(j, 2.1, sd * 3.0, 0, 1.0, 3.1, 0.8, '#8a8a92');
+          for (const a of [-1, 1]) for (const b of [-1, 1]) bx(j, 5.56, sd * 3.0 + b * 0.55, a * 0.65, 0.25, 0.35, 0.25, '#9a9aa2');
+          bx(j, 6.9, sd * 3.0, 0, 0.05, 1.3, 0.05, '#5a4a3a');
+          bx(j, 7.75, sd * 3.0 + 0.45 * -sd, 0, 0.04, 0.3, 0.45, sd > 0 ? '#e8384f' : '#2f7ae8');
+        }
+      }
+    } else if (id === 'rock') {
+      // ごつごつした岩を外にかぶせる（形は種で決まるので、毎回同じ）
+      if (k % 4 === 0 || end) {
+        // 屋根の上の岩と、両わきの岩（中の面より外にだけ置く。中に突き出すと、乗っている目の前をふさぐ）
+        const shade = () => ['#8a7e70', '#7a6e62', '#9a8e7e', '#6e645a'][Math.floor(r() * 4)];
+        for (let q = 0; q < (end ? 3 : 2); q++) {
+          const lu = 0.4 + r() * 0.5;
+          bx(j, TOP + SH + lu - 0.1, (r() - 0.5) * 4.4, (r() - 0.5) * 0.6, 0.6 + r() * 0.5, lu, 0.6 + r() * 0.5, shade());
+        }
+        for (const sd of [-1, 1]) {
+          const lr = 0.4 + r() * 0.5;
+          const du = (low ? 0.6 : -0.2) + r() * 3.2;
+          // カーブの内側でも中へ出ないよう、殻から少し離し、線路の向きには短くする
+          bx(j, du, sd * (W2 + SH + lr + 0.05), (r() - 0.5) * 0.4, 0.45 + r() * 0.3, 0.5 + r() * 0.5, lr, shade());
+        }
+        if (low && !end) for (const sd of [-1, 1]) bx(j, 0.3, sd * (W2 + 0.9), 0, 0.7, 0.9, 0.8, m ? '#7a6e62' : '#6e645a');
+      }
+    } else if (id === 'monster') {
+      // 背中のとげ（2 m おき）
+      if (!end && k % 4 === 0) {
+        const p = Q(j, TOP + SH, 0);
+        const q = Q(j, TOP + SH + 1.0, 0, -0.5);
+        deco.beam(p, q, 0.12, 0.7, '#f0b030', [tr.tx[j], tr.ty[j], tr.tz[j]]);
+      }
+      if (enter) {
+        // 入口が怪獣の顔：頭・目・歯（歯は天井より下に出しすぎない。乗る人は 2 m くらい）
+        bx(j, TOP + SH + 0.82, 0, -0.2, 0.9, 0.8, 2.6, '#4a9a3a');
+        for (const sd of [-1, 1]) {
+          bx(j, TOP + SH + 1.0, sd * 1.15, -1.12, 0.04, 0.5, 0.5, '#ffffff');
+          bx(j, TOP + SH + 0.95, sd * 1.05, -1.18, 0.03, 0.26, 0.2, '#1e1a22');
+          bx(j, TOP + SH + 1.75, sd * 1.9, -0.3, 0.25, 0.45, 0.2, '#f0b030'); // 角
+        }
+        for (let q = 0; q < 7; q++) {
+          const dr = -1.6 + q * (3.2 / 6);
+          bx(j, TOP - 0.28, dr, -0.4, 0.12, 0.28, 0.14, '#ffffff');
+        }
+        for (const sd of [-1, 1]) for (const du of [-0.3, 0.4]) bx(j, du, sd * 1.75, -0.4, 0.12, 0.25, 0.12, '#ffffff');
+      } else if (end) {
+        // 出口はしっぽの先
+        bx(j, 4.6, 0, 0.6, 0.6, 0.3, 0.3, '#4a9a3a');
+        bx(j, 5.0, 0, 1.3, 0.4, 0.2, 0.2, '#f0b030');
+      }
+    } else if (id === 'ice') {
+      if (!end) {
+        bx(j, TOP + SH + 0.13, 0, 0, L, 0.12, W2 + SH + 0.15, '#ffffff'); // 屋根の雪（殻の屋根と面をそろえない）
+        // 外の両わきに下がるつらら
+        for (const sd of [-1, 1]) {
+          const len = 0.3 + r() * 0.6;
+          bx(j, TOP - len, sd * (W2 + SH + 0.12), 0, 0.1, len, 0.08, '#eaf8ff');
+        }
+      } else for (const sd of [-1, 1]) bx(j, 4.4, sd * 2.0, 0, 0.35, 0.7, 0.3, '#bfe8ff'); // 氷の結晶
+    } else if (id === 'candy') {
+      if (!end) {
+        bx(j, TOP + SH + 0.13, 0, 0, L, 0.12, W2 + SH + 0.12, '#ffffff'); // 屋根のクリーム
+        for (const sd of [-1, 1]) {
+          const len = 0.2 + ((k >> 1) % 3) * 0.2;
+          bx(j, TOP + SH - len, sd * (W2 + SH + 0.04), 0, 0.22, len, 0.05, '#ffffff'); // たれたクリーム
+        }
+        for (let q = 0; q < 2; q++) bx(j, TOP + SH + 0.29, (r() - 0.5) * 3.4, (r() - 0.5) * 0.8, 0.12, 0.04, 0.04, SPRINKLES[Math.floor(r() * SPRINKLES.length)]);
+      } else {
+        // 入口・出口の柱はキャンディ（赤と白の段。外から見るだけ）
+        for (const sd of [-1, 1]) for (let q = 0; q < 8; q++) bx(j, -0.6 + q * 0.58 + 0.29, sd * 2.5, 0, 0.3, 0.29, 0.3, q % 2 ? '#ffffff' : '#e8384f');
+        bx(j, 4.55, 0, 0, 0.45, 0.3, 2.9, '#8a5a3a'); // 板チョコ
+        for (let q = -2; q <= 2; q++) bx(j, 4.55, q * 1.1, fo * 0.46, 0.02, 0.22, 0.45, '#a0704a');
+      }
+    }
+  }
 }
 function lerp3(a, b, t) {
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
@@ -1989,8 +2226,10 @@ export class Crowd {
 
 // ---------------- 飛び散るもの（土ぼこり・水しぶき・火花・星） ----------------
 export class Particles {
-  constructor(max = 400) {
+  // normal：重ねても白く飛ばない、ふつうの重ね方（水の粒。色は薄くせず、寿命で消す）
+  constructor(max = 400, size = 1.4, normal = false) {
     this.max = max;
+    this.normal = normal;
     this.pos = new Float32Array(max * 3);
     this.colr = new Float32Array(max * 3);
     this.list = [];
@@ -2006,7 +2245,9 @@ export class Particles {
       x.fillRect(0, 0, w, h);
     });
     // 足し算で重ねる（色を暗くして消すので、黒い玉にならない）
-    this.points = new THREE.Points(g, new THREE.PointsMaterial({ size: 1.4, map: dot, vertexColors: true, transparent: true, depthWrite: false, sizeAttenuation: true, blending: THREE.AdditiveBlending }));
+    this.points = new THREE.Points(g, new THREE.PointsMaterial(normal
+      ? { size, map: dot, vertexColors: true, transparent: true, opacity: 0.75, depthWrite: false, sizeAttenuation: true }
+      : { size, map: dot, vertexColors: true, transparent: true, depthWrite: false, sizeAttenuation: true, blending: THREE.AdditiveBlending }));
     this.points.frustumCulled = false;
     this.geo = g;
   }
@@ -2018,6 +2259,26 @@ export class Particles {
       const s = Math.random() * speed;
       this.list.push({ x, y, z, vx: Math.cos(a) * s, vy: up * (0.5 + Math.random()), vz: Math.sin(a) * s, t: 0, life: life * (0.6 + Math.random() * 0.6), c, grav });
     }
+  }
+  // 向きを決めて飛ばす（水の壁・水のアーチ）。v は [vx, vy, vz]、jit はばらつき（m/s）
+  shoot(x, y, z, v, color, jit = 1, life = 1.2, grav = 9.8) {
+    const r = () => (Math.random() - 0.5) * 2 * jit;
+    const p = { x, y, z, vx: v[0] + r(), vy: v[1] + r(), vz: v[2] + r(), t: 0, life: life * (0.7 + Math.random() * 0.5), c: this.colOf(color), grav };
+    // 満杯なら、古いものから順に上書きする（shift で配列全体をずらすと、一度にたくさん出すとき重い）
+    if (this.list.length >= this.max) {
+      this.wi = ((this.wi || 0) + 1) % this.max;
+      this.list[this.wi] = p;
+    } else this.list.push(p);
+  }
+  // 色は文字列ごとに一度だけ作る
+  colOf(color) {
+    this.cols = this.cols || new Map();
+    let c = this.cols.get(color);
+    if (!c) {
+      c = col(color);
+      this.cols.set(color, c);
+    }
+    return c;
   }
   update(dt) {
     const L = this.list;
@@ -2038,7 +2299,7 @@ export class Particles {
       this.pos[i * 3] = p.x;
       this.pos[i * 3 + 1] = p.y;
       this.pos[i * 3 + 2] = p.z;
-      const f = 1 - p.t / p.life;
+      const f = this.normal ? 1 : 1 - p.t / p.life;
       this.colr[i * 3] = p.c.r * f;
       this.colr[i * 3 + 1] = p.c.g * f;
       this.colr[i * 3 + 2] = p.c.b * f;

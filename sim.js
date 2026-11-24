@@ -2,7 +2,7 @@
 // 同じ設計なら同じ結果になるよう、刻みは 1/120 秒で固定し、乱数は設計から作った種で出す。
 // 列車は線路の上の 1 つの位置 s（先頭車）で動かし、後ろの車両は一定の間隔で並べる。
 // 線路が耐えられない力・お客さんが耐えられない浮き上がりや横の力がかかると、壊れる・飛んでいく。
-import { G, DS, F, MATS, BARS, STARTS, CHUNK, inWater, GAP_LEN, MAX_GIMMICKS, chunkOf, rng, pathOf, polyLen, placeGimmicks, launchTrims, TRIM_DV2, GIMMICKS, loopShape, turnOf } from './track.js';
+import { G, DS, F, MATS, BARS, STARTS, CHUNK, inWater, GAP_LEN, MAX_GIMMICKS, chunkOf, rng, pathOf, polyLen, placeGimmicks, launchTrims, TRIM_DV2, GIMMICKS, loopShape, turnOf, PHYS, ROLL_RH, HOLD_LEN, DROP_RAMP, DROP_TURN, SPLASH_LOW } from './track.js';
 import { normalize } from './codec.js';
 
 export const DT = 1 / 120;
@@ -15,41 +15,27 @@ const BRAKE_A = 9;
 const BRAKE_V = 9;
 const ST_BRAKE_A = 12;
 const FRIC = 0.12;
+// 線路・安全バーの特性（物理の版 2〜。超合金・がっちりハーネスは変えない）
+const STEEL_RES = 0.5; // 鉄製：なめらかで、車輪の摩擦・抵抗が少ない（ころがりの摩擦と、速さで増える抵抗にかける）
+const WOOD_TAU = 0.3; // 木製：しなるので、線路が耐えられるかは長めにならした上下の G で見る（短い衝撃に強い）
+const WOOD_LAND = 0.5; // 木製：着地の衝撃のうち線路に伝わる割合
+const COLLAPSE_LOOK = 0.4; // 大崩壊の判定：壊れたあと何秒ぶん先まで見て、本来かかるはずだった G を出すか
 const DRAG = 0.0004;
+const MAX_T = 160;
+const SPLASH_K = 0.012; // 水しぶき：水の抵抗（速さの 2 乗にかける。18 m で速さが約 8 割になる）
+const HOLD_WAIT = 2; // 垂直落下：てっぺんで止まっている秒数
+const HOLD_STOP_A = 7; // てっぺんで止めるブレーキ（m/s²）
+const HOLD_CRAWL = 2.5; // てっぺんの平らな所を進む速さ（m/s）
+// これより速く（約 22 km/h）てっぺんに来たら、縁で止めずに、ゆっくりにしてそのまま落とす（勢いよく来た列車が坂の途中のような所で
+// 急に止まると、故障して止まったように見えた。オーナーの指摘）。止めずに速いまま落とすと、引き起こしの G が大きすぎて折れる
+const HOLD_SKIP_V = 6;
+const SPLASH_K_HIGH = 0.003; // 水のカーテン（高い所の水しぶき）：少しだけ減速する
+// めったに出ない結果の境目（GA の 2026-10-28・29 の 8,807 回で、超成功は 0.44%）
+export const SUPER_FUN = 90;
+export const SUPER_SAFE = 90;
+// 線路の強さに対して、上下・横の G が何倍か
+const overOf = (gU, gR, m) => Math.max(gU / m.v, -gU / (m.v * 0.7), Math.abs(gR) / m.l);
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
-
-// 準備計算専用の上限。実走行の時間制限には使わない。
-const PREP_SIM_LIMIT = 900;
-
-// 巻き上げは一定速度なので、バンク計算用の試走では巻き上げ区間を解析的に飛ばす。
-// 高さ600m級で「準備中」のまま長時間メインスレッドを占有するのを防ぐ。
-function runDryEstimate(dry, tr) {
-  // 駅を出て巻き上げが始まるところまでは通常どおり計算する。
-  while (dry.mode !== 'done' && dry.t < 12 && !dry.liftOn) dry.step();
-
-  if (dry.mode !== 'done' && dry.liftOn && tr.liftEnd > 0) {
-    // 巻き上げ区間の速さは LIFT_V。各点に値を埋め、バンク推定を欠かさない。
-    for (let i = 0; i < tr.n; i++) {
-      if (tr.fl[i] & F.LIFT) dry.vEst[i] = Math.max(dry.vEst[i], LIFT_V);
-    }
-    // 最後尾の車両まで巻き上げを抜けた位置へ移動する。
-    const liftExit = Math.min(dry.L - 2, tr.liftEnd * DS + (dry.nCars - 1) * CAR_GAP + 1.5);
-    if (liftExit > dry.s) {
-      dry.s = liftExit;
-      dry.v = Math.max(dry.v, LIFT_V);
-      dry.left = true;
-      dry.liftOn = false;
-      dry.liftDone = true;
-      dry.stillT = 0;
-      dry.layout();
-    }
-  }
-
-  // 発射式など、巻き上げを使わないコースも無限ループさせない。
-  // 上限到達時は取得済みの速度推定値で線路を生成する。
-  if (dry.mode !== 'done') dry.runToEnd(PREP_SIM_LIMIT);
-  return dry;
-}
 
 // 線路の上の位置 s（m）の値を、隣の点との直線補間で out に入れる
 export function sampleTrack(tr, s, out) {
@@ -93,6 +79,14 @@ export class Sim {
     this.dry = dry;
     this.mat = MATS[design.mat];
     this.bar = BARS[design.bar];
+    // 物理の版：前のコース（版 1）は前の物理のまま。特性は今の版だけ
+    this.pv = design.pv ?? PHYS;
+    const v2 = this.pv >= 2;
+    const smooth = v2 && this.mat.id === 'steel' ? STEEL_RES : 1;
+    this.fric = FRIC * smooth;
+    this.drag = DRAG * smooth;
+    this.woodFlex = v2 && this.mat.id === 'wood';
+    this.barSupport = v2 && this.bar.id === 'bar';
     this.launchV = STARTS[design.start].v;
     this.rand = rng(seedOf(design));
     this.t = 0;
@@ -109,7 +103,7 @@ export class Sim {
     this.vEst = dry ? new Float64Array(tr.n) : null;
     this.cars = [];
     for (let c = 0; c < this.nCars; c++) {
-      const car = { s: 0, p: [0, 0, 0], f: mk(), gU: 1, gR: 0, gT: 0, gUf: 1, gRf: 0, body: null, riders: [] };
+      const car = { s: 0, p: [0, 0, 0], f: mk(), gU: 1, gR: 0, gT: 0, gUf: 1, gRf: 0, gWf: 1, body: null, riders: [] };
       for (let k = 0; k < 2; k++) {
         car.riders.push({
           id: c * 2 + k, side: k, state: 'seat', faintT: 0, body: null, j: 0.85 + this.rand() * 0.3, hands: 0, scream: 0,
@@ -122,9 +116,12 @@ export class Sim {
     this.chunkSt = tr.chunks.map(() => null); // 崩れる線路のかたまり { t0, th, om, ax, az, max, h, done }
     this.st = {
       maxV: 0, maxG: 1, minG: 1, maxLat: 0, air: 0, inv: 0, jumps: 0, ejected: 0, fainted: 0, stars: 0,
-      broke: false, collapse: false, drop: 0, rideT: 0, maxH: tr.maxH, splash: 0, landed: 0,
+      broke: false, collapse: false, drop: 0, rideT: 0, maxH: tr.maxH, splash: 0, landed: 0, sprays: 0, tunnels: 0, drops: 0,
     };
     this.stillT = 0;
+    this.prevFl = 0; // 前の刻みの先頭車の区間（水しぶき・トンネルに入ったかを見る）
+    this.holdS = 0; // 垂直落下のてっぺん：0 まだ、1 止めている、2 待っている、3 押し出した
+    this.holdT = 0;
     this.airRun = 0;
     this.inverted = false;
     this.air = null; // ジャンプ中 { p, v, trail: [[x,y,z,d]], d, gapEnd }
@@ -203,16 +200,10 @@ export class Sim {
     this.stepChunks(dt);
     this.stepBodies(dt);
     this.layout();
-    // 高高度・極端な加速度で数値が非有限になった場合だけ安全終了する。
-    // 時間上限ではなく NaN / Infinity による無限計算を防ぐガード。
-    const lead = this.cars && this.cars[0];
-    if (this.mode !== 'done' && (!Number.isFinite(this.t) || !Number.isFinite(this.s) || !Number.isFinite(this.v) || (lead && (!Number.isFinite(lead.f.x) || !Number.isFinite(lead.f.y) || !Number.isFinite(lead.f.z))))) {
-      this.emit('stuck', Number.isFinite(lead?.f?.x) ? lead.f.x : 0, Number.isFinite(lead?.f?.y) ? lead.f.y : 0, Number.isFinite(lead?.f?.z) ? lead.f.z : 0);
-      this.finish('stuck');
-    }
     if (this.mode !== 'done') {
       if (this.mode === 'crash' && this.crashT > 7 && this.settled()) this.finish();
       else if (this.mode === 'crash' && this.crashT > 14) this.finish();
+      else if (this.t > MAX_T) this.finish('stuck');
     } else this.endT += dt;
   }
 
@@ -238,7 +229,7 @@ export class Sim {
     for (const car of this.cars) a += -G * car.f.ty;
     a /= n;
     const v0 = this.v;
-    a -= Math.sign(v0) * FRIC + DRAG * v0 * Math.abs(v0);
+    a -= Math.sign(v0) * this.fric + this.drag * v0 * Math.abs(v0);
     const leadI = lead.f.i;
     const fl = tr.fl[leadI];
     let chain = false;
@@ -257,7 +248,41 @@ export class Sim {
       // 駅に戻った：ブレーキで止める
       if (this.v > 0) a = Math.min(a, -ST_BRAKE_A);
     }
-    let v = this.v + a * dt;
+    // 水しぶき：水の抵抗で大きく減速する
+    if (fl & F.SPLASH) a -= (lead.f.y < SPLASH_LOW ? SPLASH_K : SPLASH_K_HIGH) * v0 * Math.abs(v0);
+    // 垂直落下：てっぺんで止めて、少し待ってから押し出す
+    let hold = false;
+    if ((fl & F.HOLD) && this.lap === 0 && this.holdS !== 3) {
+      // 1 = 縁で止める、4 = ゆっくりにして止めずに落とす
+      if (!this.holdS) this.holdS = this.v > HOLD_SKIP_V ? 4 : 1;
+      if (this.holdS === 4 && this.v > HOLD_CRAWL) a = Math.min(a, -HOLD_STOP_A);
+      else if (this.holdS === 4 && this.v < HOLD_CRAWL * 0.8) a = Math.max(a, 2);
+      // てっぺんの平らな所はゆっくり（約 9 km/h）進み、落ちる縁で止める
+      if (this.holdS === 1 && !(fl & F.EDGE)) {
+        if (this.v > HOLD_CRAWL) a = Math.min(a, -HOLD_STOP_A);
+        else if (this.v < HOLD_CRAWL * 0.8) a = Math.max(a, 2);
+      } else if (this.holdS === 1) {
+        if (this.v > 0.4) a = Math.min(a, -HOLD_STOP_A);
+        else if (this.v >= 0) {
+          this.holdS = 2;
+          this.holdT = 0;
+          this.emit('hold', lead.f.x, lead.f.y, lead.f.z);
+        }
+      }
+      if (this.holdS === 2) {
+        hold = true;
+        this.holdT += dt;
+        if (this.holdT > HOLD_WAIT) {
+          this.holdS = 3;
+          this.emit('release', lead.f.x, lead.f.y, lead.f.z, { n: this.st.drops });
+        }
+      }
+    }
+    if (this.holdS === 3 && (fl & F.HOLD) && this.v < 3) a = Math.max(a, 3);
+    let v = hold ? 0 : this.v + a * dt;
+    if (this.holdS === 1 && (fl & F.HOLD) && this.v > 0 && v < 0) v = 0;
+    // 垂直落下のてっぺんで止めている間は、後ろの車両が巻き上げの上にいても引かない
+    if (chain && (fl & F.HOLD)) chain = false;
     if (chain && v < LIFT_V) {
       if (this.v < 0 && this.left && this.liftDone) {
         // 巻き上げの逆戻り防止の爪に引っかかった（もう一度登っても同じ）
@@ -325,7 +350,7 @@ export class Sim {
       }
     }
     if (this.dry) {
-      if (Math.abs(this.v) < 0.1 && !chain && !inSt) this.stillT += dt;
+      if (Math.abs(this.v) < 0.1 && !chain && !inSt && !(fl & F.HOLD)) this.stillT += dt;
       else this.stillT = 0;
       if (this.stillT > 2.5) this.finish('stuck');
       return;
@@ -363,14 +388,35 @@ export class Sim {
     if (lead.f.uy < -0.3 && !this.inverted) {
       this.inverted = true;
       this.st.inv++;
-      this.emit('invert', lead.f.x, lead.f.y, lead.f.z);
+      this.emit('invert', lead.f.x, lead.f.y, lead.f.z, { roll: (this.tr.fl[lead.f.i] & F.ROLL) !== 0 });
     } else if (lead.f.uy > 0.3) this.inverted = false;
     // 立ち往生（止まった・谷で行ったり来たりしはじめた）
-    if (Math.abs(this.v) < 0.12 && !chain && !inSt) this.stillT += dt;
+    if (Math.abs(this.v) < 0.12 && !chain && !inSt && !hold && !(fl & F.HOLD)) this.stillT += dt;
     else this.stillT = 0;
-    if (this.left && Math.sign(this.v) !== Math.sign(v0) && v0 !== 0 && !chain) this.flips = (this.flips || 0) + 1;
+    // 水しぶき・トンネル・垂直落下に入った（先頭車で数える）
+    const enter = fl & ~this.prevFl;
+    this.prevFl = fl;
+    // 前向きに入ったときだけ数える（坂を登れずに戻って逆向きに通ったときは数えない）
+    if ((enter & F.SPLASH) && this.v > 0) {
+      this.st.sprays++;
+      this.emit('spray', lead.f.x, lead.f.y, lead.f.z, { v: Math.abs(this.v), low: lead.f.y < SPLASH_LOW });
+    }
+    if ((enter & F.TUNNEL) && this.v > 0) {
+      this.st.tunnels++;
+      this.emit('tunnel', lead.f.x, lead.f.y, lead.f.z);
+    }
+    if ((enter & F.DROP) && this.v > 0) {
+      this.st.drops++;
+      // n：何番目の垂直落下か（main.js が「90度超え」かを見る）
+      this.emit('drop', lead.f.x, lead.f.y, lead.f.z, { held: this.holdS === 3, n: this.st.drops - 1 });
+      // 垂直落下ごとに、てっぺんで止める状態を戻す（2 つ目でもまた止める。1.2.x のレビューの指摘）
+      this.holdS = 0;
+      this.holdT = 0;
+    }
+    // 行ったり来たり（垂直落下のてっぺんで止めたときは数えない）
+    if (this.left && Math.sign(this.v) !== Math.sign(v0) && v0 !== 0 && !chain && !(fl & F.HOLD)) this.flips = (this.flips || 0) + 1;
     if (v0 > 0 && this.v <= 0 && lead.f.uy < 0) this.st.loopStall = true;
-    if (this.stillT > 5 || this.flips >= 3) {
+    if (this.stillT > 2.5 || this.flips >= 3) {
       this.emit('stuck', lead.f.x, lead.f.y, lead.f.z);
       this.finish('stuck');
     }
@@ -388,10 +434,16 @@ export class Sim {
       const ay = v2 * f.ky + aT * f.ty + G;
       const az = v2 * f.kz + aT * f.tz;
       car.gU = (ax * f.ux + ay * f.uy + az * f.uz) / G;
+      // ひねりの中：お客さんは回る軸より ROLL_RH m 上にいるので、速く回るほど外（頭の向き）へ振られる
+      if (this.tr.fl[f.i] & F.ROLL) {
+        const w = this.v * this.tr.rollRate[f.i];
+        car.gU -= (ROLL_RH * w * w) / G;
+      }
       car.gR = (ax * f.rx + ay * f.ry + az * f.rz) / G;
       car.gT = (ax * f.tx + ay * f.ty + az * f.tz) / G;
       car.gUf += (car.gU - car.gUf) * k;
       car.gRf += (car.gR - car.gRf) * k;
+      if (this.woodFlex) car.gWf += (car.gU - car.gWf) * (1 - Math.exp(-dt / WOOD_TAU));
     }
     this.checkLoads(dt);
     if (this.mode !== 'track') return;
@@ -428,17 +480,26 @@ export class Sim {
     for (let c = 0; c < this.nCars; c++) {
       const car = this.cars[c];
       // 線路
-      const over = Math.max(car.gUf / m.v, -car.gUf / (m.v * 0.7), Math.abs(car.gRf) / m.l);
+      const gV = this.woodFlex ? car.gWf : car.gUf;
+      const over = overOf(gV, car.gRf, m);
       if (over > 1 && Math.abs(this.v) > 2) {
         this.st.broke = true;
         this.emit('break', car.f.x, car.f.y, car.f.z, { g: car.gUf, lat: car.gRf });
-        this.breakAt(car.f.i, over);
+        // どれだけ強く壊れたか：版 1 は壊れた瞬間のならした G（強さをわずかに超えた所で決まるので、大崩壊はまず起きなかった）。
+        // 版 2 からは、その先で本来かかるはずだった G も見る
+        this.breakAt(car.f.i, this.pv >= 2 ? Math.max(over, this.peakOver(car)) : over);
         this.crash('break');
         return;
       }
+      // 水しぶき：前へつんのめる力（減速の G）が、安全バーの横の強さを超えると、前へ投げ出される
+      const fwd = this.tr.fl[car.f.i] & F.SPLASH && car.f.y < SPLASH_LOW ? -car.gT : 0;
       // お客さん
       for (const r of car.riders) {
         if (r.state === 'gone') continue;
+        if (fwd > b.l * r.j) {
+          this.eject(car, r, [car.f.tx, car.f.ty + 0.3, car.f.tz], 3 + this.rand() * 4);
+          continue;
+        }
         const up = -car.gUf;
         const side = Math.abs(car.gRf);
         if (up > b.v * r.j || side > b.l * r.j) {
@@ -447,9 +508,11 @@ export class Sim {
           continue;
         }
         if (r.state === 'seat') {
-          if (car.gUf > 5.2) r.faintT += dt;
+          // 安全バー（版 2〜）：体を支えられるので気絶しにくい
+          const sup = this.barSupport;
+          if (car.gUf > (sup ? 5.8 : 5.2)) r.faintT += dt;
           else r.faintT = Math.max(0, r.faintT - dt * 0.5);
-          if (r.faintT > 0.9 || car.gUf > 7.2 * r.j) {
+          if (r.faintT > (sup ? 1.3 : 0.9) || car.gUf > (sup ? 8.2 : 7.2) * r.j) {
             r.state = 'faint';
             this.st.fainted++;
             this.emit('faint', car.f.x, car.f.y, car.f.z, { id: r.id });
@@ -457,6 +520,29 @@ export class Sim {
         }
       }
     }
+  }
+
+  // 壊れなかったら、このあと COLLAPSE_LOOK 秒のあいだ、いまの速さで進んでかかったはずの G（走っているときと同じにならした値）が、
+  // 線路の強さの何倍まで上がったか
+  peakOver(car) {
+    const tr = this.tr;
+    const m = this.mat;
+    const v = this.v;
+    const k = 1 - Math.exp(-DT / (this.woodFlex ? WOOD_TAU : 0.09));
+    let gU = this.woodFlex ? car.gWf : car.gUf;
+    let gR = car.gRf;
+    let best = 0;
+    for (let t = 0, s = car.s; t < COLLAPSE_LOOK; t += DT) {
+      s += v * DT;
+      const i = ((Math.round(s / DS) % tr.n) + tr.n) % tr.n;
+      const ax = v * v * tr.kx[i];
+      const ay = v * v * tr.ky[i] + G;
+      const az = v * v * tr.kz[i];
+      gU += ((ax * tr.ux[i] + ay * tr.uy[i] + az * tr.uz[i]) / G - gU) * k;
+      gR += ((ax * tr.rx[i] + ay * tr.ry[i] + az * tr.rz[i]) / G - gR) * k;
+      best = Math.max(best, overOf(gU, gR, m));
+    }
+    return best;
   }
 
   carVel(car) {
@@ -636,7 +722,10 @@ export class Sim {
             this.mode = 'track';
             A.landed = true;
             this.air = null;
-            for (const car of this.cars) car.gUf = 1 + impact;
+            for (const car of this.cars) {
+              car.gUf = 1 + impact;
+              car.gWf = 1 + impact * WOOD_LAND;
+            }
             this.layout();
             sampleTrack(this.tr, this.s, this.cars[0].f);
             this.checkLoads(DT);
@@ -711,7 +800,7 @@ export class Sim {
   }
 
   // 最後までまとめて進める（スキップ・試算用）
-  runToEnd(maxT = Infinity) {
+  runToEnd(maxT = MAX_T + 20) {
     while (this.mode !== 'done' && this.t < maxT) this.step();
     return this.summary();
   }
@@ -731,6 +820,16 @@ export class Sim {
     fun += clamp(st.drop / 35, 0, 1) * 12;
     fun += clamp(st.rideT / 45, 0, 1) * 8;
     if (st.maxLat > 1.0) fun += 4;
+    // 水しぶき・トンネル・垂直落下（1.3.0）
+    fun += Math.min(2, st.sprays) * 6;
+    fun += Math.min(2, st.tunnels) * 5;
+    fun += Math.min(1, st.drops) * 6;
+    if (this.pv >= 2) {
+      // 特性（版 2〜）：木製はガタガタの揺れ、ベルトだけは体が自由で浮いた感じが大きい、安全バーは両手を上げられる
+      if (this.mat.id === 'wood') fun += clamp(st.rideT / 30, 0, 1) * 8;
+      if (this.bar.id === 'belt') fun += clamp(st.air / 2, 0, 1) * 10;
+      if (this.bar.id === 'bar') fun += clamp(st.air / 2, 0, 1) * 4;
+    }
     fun = Math.round(clamp(fun, 0, 100));
     // 安全
     let safe = 100;
@@ -746,6 +845,10 @@ export class Sim {
     else if (!clear || lost > 0) grade = 'fail';
     else if (fun >= 60 && safe >= 70) grade = 'great';
     else grade = 'ok';
+    // めったに出ない結果（1.3.0）：超成功＝楽しさも安全も 90 以上。
+    // 超失敗＝大崩壊して、全員が飛んで、遠くまで飛んでいった人もいる（どれか 1 つなら珍しくない。3 つそろうのはまれ）
+    if (grade === 'great' && fun >= SUPER_FUN && safe >= SUPER_SAFE) grade = 'super';
+    if (grade === 'bigfail' && st.collapse && nR >= 2 && lost >= nR && st.stars >= 1) grade = 'superfail';
     return { grade, fun, safe, result: this.result, why: this.why || '', riders: nR, ...st, time: this.t };
   }
 }
@@ -853,11 +956,10 @@ export function addBrakesUntilSafe(design, buildTrack, maxAdd = 5) {
     const sim = new Sim(tr, d);
     // 1 周目にいちばん先まで進んだ所（坂を登りきれずに駅まで戻ったときに使う）
     let far = 0;
-    while (sim.mode !== 'done' && sim.t < PREP_SIM_LIMIT) {
+    while (sim.mode !== 'done' && sim.t < MAX_T + 20) {
       sim.step();
       if (!sim.lap && sim.s > far) far = sim.s;
     }
-    if (sim.mode !== 'done') return { gm, added, ok: false };
     const r = sim.summary();
     if (r.result === 'clear' && !r.ejected) return { gm, added, ok: true };
     // ブレーキで遅くなりすぎて、坂を登れなかった：足す前に戻してやめる
@@ -919,7 +1021,7 @@ export function safeAutoHeights(design, seed, peak, autoHeights, buildTrack, kin
   for (let k = 0; k < 5; k++) {
     hs = autoHeights(design, seed + k * 101, peak * (1 - k * 0.12), kind);
     const d = { mat: 1, bar: 1, cars: 4, start: 0, gm: [], ...design, hs };
-    const r = new Sim(prepare(d, buildTrack), d).runToEnd(PREP_SIM_LIMIT);
+    const r = new Sim(prepare(d, buildTrack), d).runToEnd();
     if (r.result === 'clear' && !r.ejected) break;
   }
   return hs;
@@ -1000,18 +1102,25 @@ export const GIMMICK_THEMES = [
   ['loop', 'jump'],
   ['boost', 'loop'],
   ['boost', 'boost'],
+  ['roll'],
+  ['loop', 'roll'],
+  ['tunnel'],
+  ['splash'],
+  ['tunnel', 'loop'],
+  ['drop'],
+  ['drop', 'splash'],
 ];
 // 速さの見込み（道の上の位置 m ごと、m/s）。力の確かめをしない試し走り（prepare と同じ）から
 function speedAlong(design, buildTrack, Lf) {
   const tr = buildTrack(design, null);
   const dry = new Sim(tr, design, { dry: true });
-  runDryEstimate(dry, tr);
+  dry.runToEnd();
   const v = new Float64Array(Math.ceil(Lf) + 2);
   let acc = 0;
   let all = 0;
   const ms = new Float64Array(tr.n);
   for (let k = tr.stEnd + 1; k < tr.n; k++) {
-    if (!(tr.fl[k] & F.LOOP)) all += Math.hypot(tr.px[k] - tr.px[k - 1], tr.pz[k] - tr.pz[k - 1]);
+    if (!(tr.fl[k] & (F.LOOP | F.ROLL))) all += Math.hypot(tr.px[k] - tr.px[k - 1], tr.pz[k] - tr.pz[k - 1]);
     ms[k] = all;
   }
   for (let k = tr.stEnd + 1; k < tr.n; k++) {
@@ -1024,14 +1133,18 @@ function speedAlong(design, buildTrack, Lf) {
 // 置ける所の候補（道の上の位置 m）。宙返り・ジャンプはまっすぐな所（③ の緑の帯と同じ決まり）で、
 // 入る速さが合う所（宙返りは約 58〜94 km/h、ジャンプは約 58〜72 km/h。ブースターは 70 km/h より遅い所）。
 // 速さの幅は、道 9 型 × 高さ 3 型で 9 m おきに置いて走らせた結果から決めた（遅いと止まる・着地の坂の手前に落ちる、速いと先に落ちる）
-const V_RANGE = { loop: [16, 26], jump: [16, 20], boost: [0, 20], brake: [0, 99] };
+// ひねりは、安全バーのお客さんが逆さまで振り落とされない速さ（約 50 km/h まで）
+// 水しぶきは、前へ投げ出されない速さ（約 75 km/h まで）。トンネルはどこでも
+// 垂直落下は、手前の巻き上げで止めてから落とすので、入る速さは問わない（速すぎるとてっぺんで止まりきれないので、約 60 km/h まで）
+const V_RANGE = { loop: [16, 26], jump: [16, 20], boost: [0, 20], brake: [0, 99], roll: [6, 13], splash: [8, 21], tunnel: [0, 99], drop: [0, 17] };
 function spotsFor(t, path, Lf, vAt) {
   const len = t === 'loop' ? loopShape().adv : GIMMICKS[t].len;
   const [v0, v1] = V_RANGE[t];
   const out = [];
   for (let m = 44; m + len < Lf - 40; m += 2) {
-    if (t === 'loop' && turnOf(path, m - 10, m + len + 10) > 1.1) continue;
+    if ((t === 'loop' || t === 'roll') && turnOf(path, m - 10, m + len + 10) > 1.1) continue;
     if (t === 'jump' && turnOf(path, m - 6, m + len + 14) > 0.5) continue;
+    if (t === 'drop' && (m < HOLD_LEN + DROP_RAMP + 20 || turnOf(path, m - 6, m + len + 6) > DROP_TURN)) continue;
     const v = vAt[Math.min(vAt.length - 1, Math.round(m))];
     if (v < v0 || v > v1) continue;
     out.push(m);
@@ -1107,7 +1220,7 @@ export function autoGimmicks(design, buildTrack, theme, rnd = Math.random, tries
       // それ以外で、ブースター・ブレーキだけで事故が残るものは、コースが悪くなるだけなので使わない
       const run = runOf({ ...design, gm: res.gm }, buildTrack);
       const rank = rankOf(run.r);
-      const fun = res.gm.some((g) => g.t === 'loop' || g.t === 'jump');
+      const fun = res.gm.some((g) => g.t !== 'boost' && g.t !== 'brake');
       const pass = baseStuck && res.gm.some((g) => g.t === 'boost') && !['stuck', 'rollback'].includes(run.r.result);
       const score = rank * 2 - (fun ? 1 : 0);
       // 置く前は事故なく走れるコース（baseRank 0）には、事故の起きる置き方は置かない（押す前より悪くなるので。0.1.40）
@@ -1144,13 +1257,13 @@ function runOf(design, buildTrack) {
 }
 const summaryOf = (design, buildTrack) => runOf(design, buildTrack).r;
 // 結果の重さ：0 大成功・成功、1 失敗（止まった・飛ばされた）、2 大失敗（事故）
-const rankOf = (r) => (r.grade === 'bigfail' ? 2 : r.grade === 'fail' ? 1 : 0);
+const rankOf = (r) => (r.grade === 'bigfail' || r.grade === 'superfail' ? 2 : r.grade === 'fail' ? 1 : 0);
 
 // 設計をまとめて試す：予想の速さでバンクを付けた線路と、結果
 export function prepare(design, buildTrack) {
   const dryTr = buildTrack(design, null);
   const dry = new Sim(dryTr, design, { dry: true });
-  runDryEstimate(dry, dryTr);
+  dry.runToEnd();
   const tr = buildTrack(design, dry.vEst);
   return tr;
 }

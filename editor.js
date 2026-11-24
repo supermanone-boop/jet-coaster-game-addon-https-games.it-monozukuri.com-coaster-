@@ -1,14 +1,16 @@
 // editor.js — 設計の 3 画面（① 上から道を描く ② 横から高さを描く ③ しかけと設定）
 // 方眼紙に手で描く見た目。描き終わるたびに線路を組んで、予想の速さ・ぶつかる所・費用を出す。
 import {
-  FIELD, STATION, MAPS, mapOf, H_SAMPLES, H_MAX, H_MIN, GIMMICKS, GIMMICK_KEYS, MAX_GIMMICKS, MATS, BARS, STARTS,
-  MAX_LEN, MAX_CARS, STROKE_KINDS, HEIGHT_KINDS, PEAK_TIERS, launchGentle, launchGuide, horizPath, pathOf, polyLen, defaultHeights, autoHeights, costOf, leadOf, loopShape, turnOf, buildTrack, placeGimmicks, randomStroke, F, ST_LEN,
+  FIELD, STATION, MAPS, mapOf, H_SAMPLES, H_MAX, H_MIN, GIMMICKS, GIMMICK_KEYS, MAX_GIMMICKS, MATS, BARS, STARTS, PHYS,
+  DROP_TURN, MAX_LEN, MAX_CARS, STROKE_KINDS, HEIGHT_KINDS, PEAK_TIERS, launchGentle, launchGuide, horizPath, pathOf, polyLen, defaultHeights, autoHeights, costOf, leadOf, loopShape, turnOf, buildTrack, placeGimmicks, randomStroke, F, ST_LEN,
 } from './track.js';
 import { fixCurves, smoothCurves } from './fix.js';
+// ③ で、置ける所（まっすぐな所）を緑の帯で出すしかけ
+const BAND_TOOLS = { loop: true, jump: true, roll: true, drop: true };
 import { themeLayout, layoutDots } from './themes.js';
 import { Sim, safeAuto, autoGimmicks, GIMMICK_THEMES } from './sim.js';
 import { sound } from './audio.js';
-import { RAIL_LOOKS, CAR_LOOKS, RIDER_LOOKS, SCENE_LOOKS, cleanLook } from './looks.js';
+import { RAIL_LOOKS, CAR_LOOKS, RIDER_LOOKS, SCENE_LOOKS, TUNNEL_LOOKS, cleanLook } from './looks.js';
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const PAPER = '#fbf8ef';
@@ -116,29 +118,6 @@ export class Editor {
     this.btnClear = root.querySelector('#ed-clear');
     // おまかせの結果を出すカード（図の上）
     this.cvWrap = root.querySelector('.ed-canvas-wrap');
-    // 拡張版：広い敷地をズーム／パンして編集する。初期表示は旧版と同じ範囲。
-    this.mapView = { cx: 0, cz: 0, zoom: 1 };
-    this.panning = null;
-    const viewTools = document.createElement('div');
-    viewTools.className = 'ed-exp-viewtools';
-    viewTools.innerHTML = '<button type="button" data-map="out" aria-label="縮小">−</button><button type="button" data-map="in" aria-label="拡大">＋</button><button type="button" data-map="fit">全体</button><span data-map-label>100%</span><div class="ed-exp-pan"><button type="button" data-map="up">▲</button><div><button type="button" data-map="left">◀</button><button type="button" data-map="down">▼</button><button type="button" data-map="right">▶</button></div></div>';
-    this.cvWrap.appendChild(viewTools);
-    viewTools.addEventListener('click', (e) => {
-      const b = e.target.closest('button[data-map]');
-      if (!b) return;
-      const a = b.dataset.map;
-      const v = this.mapView;
-      if (a === 'in') v.zoom = clamp(v.zoom * 1.25, 0.06, 8);
-      else if (a === 'out') v.zoom = clamp(v.zoom / 1.25, 0.06, 8);
-      else if (a === 'fit') this.fitMapView();
-      else if (a === 'up') v.cz -= 45 / v.zoom;
-      else if (a === 'down') v.cz += 45 / v.zoom;
-      else if (a === 'left') v.cx -= 45 / v.zoom;
-      else if (a === 'right') v.cx += 45 / v.zoom;
-      this.draw();
-      const label = viewTools.querySelector('[data-map-label]');
-      if (label) label.textContent = `${Math.round(v.zoom * 100)}%`;
-    });
     this.toastEl = document.createElement('div');
     this.toastEl.className = 'ed-toast';
     this.toastEl.setAttribute('role', 'status');
@@ -205,16 +184,24 @@ export class Editor {
 
   // ---------------- 元に戻す・やり直す ----------------
   snap() {
-    const { pts, hs, gm, mat, bar, cars, start, look, map } = this.design;
-    return JSON.stringify({ pts, hs, gm, mat, bar, cars, start, look, map: map || 0 });
+    const { pts, hs, gm, mat, bar, cars, start, look, map, pv } = this.design;
+    return JSON.stringify({ pts, hs, gm, mat, bar, cars, start, look, map: map || 0, pv: pv ?? PHYS });
   }
-  // 変える直前に呼ぶ
-  record() {
+  // 変える直前に呼ぶ。走りが変わる変更なら、前の物理の版のコースも今の版にする（見た目だけの変更は lookOnly）
+  record(lookOnly = false) {
     // 最後に直した段階（結果の「なおす」でそこへ戻る）
     this.editStep = this.step;
     this.undoStack.push(this.snap());
+    if (!lookOnly) this.design.pv = PHYS;
     if (this.undoStack.length > 60) this.undoStack.shift();
     this.redoStack.length = 0;
+    this.updateUndo();
+  }
+  // 直前の record を取り消す（結局何も変えなかったとき）。物理の版も元に戻す
+  unrecord() {
+    const s = this.undoStack.pop();
+    if (!s) return;
+    this.design.pv = JSON.parse(s).pv;
     this.updateUndo();
   }
   restore(str) {
@@ -244,15 +231,12 @@ export class Editor {
 
   open(design, step = 1) {
     this.design = design;
-    this.mapView = { cx: 0, cz: 0, zoom: 1 };
-    this.panning = null;
     this.undoStack.length = 0;
     this.redoStack.length = 0;
     this.updateUndo();
     this.editStep = 0;
     this.root.hidden = false;
     this.go(step);
-    if (step === 1 && this.design.pts && this.design.pts.length > 1) this.fitMapView();
   }
   close() {
     this.closeLook();
@@ -344,7 +328,7 @@ export class Editor {
       this.hint.textContent = !drawn ? '指で山を描こう！ 描きにくければ「おまかせ」' : d.start > 0 ? '指でなぞると高さが変わる。駅を出てすぐ発射で一気に加速します' : '指でなぞると高さが変わる。最初の坂は巻き上げ（チェーン）で登ります';
       this.btnNext.disabled = !drawn;
     } else if (this.step === 3) {
-      this.hint.textContent = `しかけを選んで、図をタップして置く（置いたものをタップで外す）。${d.gm.length}/${MAX_GIMMICKS}個・置かなくても走れます`;
+      this.hint.textContent = 'しかけを選んで、図をタップして置く（置いたものをタップで外す）。置かなくても走れます';
       this.btnNext.disabled = !p;
     } else {
       this.hint.textContent = '線路の強さ・安全バー・車両の数・スタートのしかたで、結果が大きく変わります';
@@ -382,7 +366,8 @@ export class Editor {
         items.push(L('blue', '予想の速さ（数字は最高速度）'), L('box', '巻き上げ（チェーンで登る）'));
         if (this.preview && this.preview.tr && this.preview.tr.clashes.length) items.push(T('<b style="color:#d02020">✕</b>', '線路がぶつかる所'));
       }
-      if (this.step === 3 && (this.tool === 'loop' || this.tool === 'jump')) items.push(L('green', this.tool === 'jump' ? 'ジャンプが着地しやすい所（まっすぐな所）' : '宙返りを置ける所'));
+      if (this.step === 3 && this.tool === 'splash') items.push(T('💦', '低い所（2.5 m より下）では水に突っ込んで大きく減速。高い所では水のカーテンをくぐる'));
+      if (this.step === 3 && BAND_TOOLS[this.tool]) items.push(L('green', this.tool === 'jump' ? 'ジャンプが着地しやすい所（まっすぐな所）' : this.tool === 'drop' ? '垂直落下を置ける所（置いた所の高さから落ちます。約 40 m より高いと、垂直を越えて落ちます）' : `${GIMMICKS[this.tool].name}を置ける所`));
     }
     if (this.step <= 3 && this.incidents && this.incidents.length) {
       // 気絶は事故ではない（1.0.7 から成功）ので、事故の場所とは分けて出す
@@ -517,8 +502,8 @@ export class Editor {
       }
       this.opts.appendChild(r);
     };
-    row('🛤 線路の強さ', MATS.map((m) => m.name), d.mat, (i) => (d.mat = i), ['弱い（4.6G まで）。壊れると全体が崩れやすい', 'ふつう（6.5G まで）', 'とても強い（10G まで）'][d.mat]);
-    row('🦺 安全バー', BARS.map((b) => b.name), d.bar, (i) => (d.bar = i), ['浮き上がると飛ばされやすい', 'たいていは大丈夫', 'まず飛ばされない'][d.bar]);
+    row('🛤 線路の強さ', MATS.map((m) => m.name), d.mat, (i) => (d.mat = i), ['弱い（4.6G まで）。しなって短い衝撃に強く、ガタガタ揺れて楽しい。壊れると全体が崩れやすい', 'ふつう（6.5G まで）。なめらかで速く、遠くまで走る', 'とても強い（10G まで）'][d.mat]);
+    row('🦺 安全バー', BARS.map((b) => b.name), d.bar, (i) => (d.bar = i), ['浮き上がると飛ばされやすい。体が自由で、浮いている時間がとても楽しい', 'たいていは大丈夫。体を支えられて気絶しにくく、両手を上げて楽しめる', 'まず飛ばされない'][d.bar]);
     row('🚃 車両の数', Array.from({ length: MAX_CARS }, (_, i) => `${i + 1}両`), d.cars - 1, (i) => (d.cars = i + 1), `お客さん ${d.cars * 2}人`);
     row('🚀 スタート', STARTS.map((s) => s.name), d.start, (i) => {
       d.start = i;
@@ -543,6 +528,7 @@ export class Editor {
     if (l.car) picked.push(`車両 ${CAR_LOOKS[l.car].name}`);
     if (l.rider) picked.push(RIDER_LOOKS[l.rider].icon + RIDER_LOOKS[l.rider].name);
     if (l.scene && !mapOf(this.design.map).scene) picked.push(SCENE_LOOKS[l.scene].icon + SCENE_LOOKS[l.scene].name);
+    if (l.tunnel) picked.push(`トンネル ${TUNNEL_LOOKS[l.tunnel].name}`);
     this.lookBtn.innerHTML = '🎨 見た目を変える' + (picked.length ? `<b>${picked.join('・')}</b>` : '<small>（走りには影響しません）</small>');
   }
   openLook() {
@@ -571,7 +557,7 @@ export class Editor {
         b.innerHTML = face(it);
         b.addEventListener('click', () => {
           if (d.look[key] === i) return;
-          this.record();
+          this.record(true);
           d.look = { ...d.look, [key]: i };
           sound.sfx('tap');
           this.renderLook();
@@ -587,6 +573,7 @@ export class Editor {
     row('🛤 線路の色', 'rail', RAIL_LOOKS, sw);
     row('🚃 車両の色', 'car', CAR_LOOKS, sw);
     row('🙋 乗る人', 'rider', RIDER_LOOKS, ic);
+    row('🚇 トンネル', 'tunnel', TUNNEL_LOOKS, sw);
     // テーマで景色が決まるときは選ばせない
     const M = mapOf(d.map);
     if (M.scene) {
@@ -617,38 +604,20 @@ export class Editor {
   // 上から見た図の座標
   mapXf() {
     const pad = 14;
-    const v = this.mapView || { cx: 0, cz: 0, zoom: 1 };
-    const baseW = 140 / v.zoom;
-    const baseH = 96 / v.zoom;
-    // 縦長の画面では 90 度回す。表示範囲は敷地全体ではなく、ズーム倍率で決める。
+    const fw = FIELD.x1 - FIELD.x0;
+    const fh = FIELD.z1 - FIELD.z0;
+    // 縦長の画面では 90 度まわす（駅が右、列車は上へ出ていく）
     const rot = this.H > this.W * 1.15;
     if (rot) {
-      const k = Math.min((this.W - pad * 2) / baseH, (this.H - pad * 2) / baseW);
-      const ox = this.W / 2 - v.cz * k;
-      const oy = this.H / 2 + v.cx * k;
+      const k = Math.min((this.W - pad * 2) / fh, (this.H - pad * 2) / fw);
+      const ox = this.W / 2 - ((FIELD.z0 + FIELD.z1) / 2) * k;
+      const oy = this.H / 2 + ((FIELD.x0 + FIELD.x1) / 2) * k;
       return { k, rot, toS: (x, z) => [ox + z * k, oy - x * k], toW: (sx, sy) => [-(sy - oy) / k, (sx - ox) / k] };
     }
-    const k = Math.min((this.W - pad * 2) / baseW, (this.H - pad * 2) / baseH);
-    const ox = this.W / 2 - v.cx * k;
-    const oy = this.H / 2 - v.cz * k;
+    const k = Math.min((this.W - pad * 2) / fw, (this.H - pad * 2) / fh);
+    const ox = (this.W - fw * k) / 2 - FIELD.x0 * k;
+    const oy = (this.H - fh * k) / 2 - FIELD.z0 * k;
     return { k, rot, toS: (x, z) => [ox + x * k, oy + z * k], toW: (sx, sy) => [(sx - ox) / k, (sy - oy) / k] };
-  }
-  fitMapView() {
-    const pts = this.design && Array.isArray(this.design.pts) ? this.design.pts : [];
-    if (pts.length < 2) {
-      this.mapView = { cx: 0, cz: 0, zoom: 1 };
-    } else {
-      const xs = pts.map(p => p[0]);
-      const zs = pts.map(p => p[1]);
-      const minX = Math.min(...xs), maxX = Math.max(...xs);
-      const minZ = Math.min(...zs), maxZ = Math.max(...zs);
-      const w = Math.max(140, maxX - minX + 80);
-      const h = Math.max(96, maxZ - minZ + 60);
-      this.mapView = { cx: (minX + maxX) / 2, cz: (minZ + maxZ) / 2, zoom: clamp(Math.min(140 / w, 96 / h), 0.06, 8) };
-    }
-    this.draw();
-    const label = this.cvWrap && this.cvWrap.querySelector('[data-map-label]');
-    if (label) label.textContent = `${Math.round(this.mapView.zoom * 100)}%`;
   }
   // 2 つの角から、画面の上の長方形（まわしたときも左上と大きさにする）
   rectS(toS, x0, z0, x1, z1) {
@@ -664,22 +633,18 @@ export class Editor {
     const padB = 26;
     const w = this.W - padL - padR;
     const h = this.H - padT - padB;
-    const heights = this.design && Array.isArray(this.design.hs) ? this.design.hs : [];
-    const currentMax = heights.reduce((m, v) => Number.isFinite(v) ? Math.max(m, v) : m, 2);
-    const Hmax = Math.max(60, Math.ceil((currentMax + 20) / 10) * 10);
+    const Hmax = H_MAX;
     return {
-      x0: padL, y0: padT, w, h, Hmax,
+      x0: padL, y0: padT, w, h,
       ux: (u) => padL + u * w,
       hy: (hh) => padT + h - (hh / Hmax) * h,
       toU: (sx) => clamp((sx - padL) / w, 0, 1),
-      toH: (sy) => clamp(((padT + h - sy) / h) * Hmax, H_MIN, Hmax),
+      toH: (sy) => clamp(((padT + h - sy) / h) * Hmax, H_MIN, H_MAX),
     };
   }
 
   draw() {
     const c = this.cx;
-    const mapTools = this.cvWrap && this.cvWrap.querySelector('.ed-exp-viewtools');
-    if (mapTools) mapTools.hidden = this.step !== 1;
     if (!c || !this.W || this.W < 80 || this.H < 80) return;
     c.fillStyle = PAPER;
     c.fillRect(0, 0, this.W, this.H);
@@ -717,8 +682,6 @@ export class Editor {
     c.strokeRect(ax, ay, aw, ah);
     c.setLineDash([]);
     this.drawMapLand(toS, k);
-    // 都市モードでは、3D生成に使った建物フットプリントを同じ座標で重ねる。
-    this.drawCityBuildings(toS, k);
     // 駅
     const [s0x, s0y, sw, sh] = this.rectS(toS, STATION.x0, STATION.z - 3, STATION.x1, STATION.z + 3);
     c.fillStyle = '#ffd9df';
@@ -867,63 +830,6 @@ export class Editor {
 
   // ① で、高さを描いたあとは、線路を予想の速さの色の帯で出し、速い所に速さを書く（1.0.15。オーナーの判断：
   // 1.0.11〜1.0.14 は高さの色だったが、カーブの事故は速さで決まるので、速さのほうが分かりやすい）
-  // 都市モードの建物を、実際の3D配置と同じ座標・向き・ footprint で平面図に表示する。
-  drawCityBuildings(toS, k) {
-    if (!document.body || document.body.dataset.coasterCourseMode !== 'city') return;
-    const getFootprints = this.getCityBuildingFootprints;
-    if (typeof getFootprints !== 'function') return;
-    const buildings = getFootprints();
-    if (!Array.isArray(buildings) || !buildings.length) return;
-
-    const c = this.cx;
-    const [fx, fy, fw, fh] = this.rectS(toS, FIELD.x0, FIELD.z0, FIELD.x1, FIELD.z1);
-    let shown = 0;
-    c.save();
-    c.beginPath();
-    c.rect(fx, fy, fw, fh);
-    c.clip();
-    for (const b of buildings) {
-      const halfW = Number(b.halfW), halfD = Number(b.halfD);
-      const x = Number(b.x), z = Number(b.z), yaw = Number(b.yaw) || 0;
-      if (![halfW, halfD, x, z].every(Number.isFinite) || halfW <= 0 || halfD <= 0) continue;
-      // Skip buildings whose footprint cannot intersect the editor's park boundary.
-      const radius = Math.hypot(halfW, halfD) + 2;
-      if (x + radius < FIELD.x0 || x - radius > FIELD.x1 || z + radius < FIELD.z0 || z - radius > FIELD.z1) continue;
-
-      const co = Math.cos(yaw), si = Math.sin(yaw);
-      const corners = [
-        [-halfW, -halfD], [halfW, -halfD], [halfW, halfD], [-halfW, halfD]
-      ].map(([lx, lz]) => toS(x + lx * co + lz * si, z - lx * si + lz * co));
-      c.beginPath();
-      c.moveTo(corners[0][0], corners[0][1]);
-      for (let i = 1; i < corners.length; i++) c.lineTo(corners[i][0], corners[i][1]);
-      c.closePath();
-      const height = Number(b.height) || 0;
-      c.fillStyle = height >= 500 ? 'rgba(105,126,139,0.88)' : height >= 180 ? 'rgba(143,158,164,0.88)' : 'rgba(185,190,184,0.92)';
-      c.strokeStyle = 'rgba(66,79,86,0.95)';
-      c.lineWidth = Math.max(0.75, Math.min(2, k * 0.38));
-      c.fill();
-      c.stroke();
-      shown++;
-    }
-    c.restore();
-
-    // Small legend matching the original map's restrained color palette.
-    c.save();
-    c.font = `700 10px ${FONT}`;
-    c.textAlign = 'right';
-    c.textBaseline = 'top';
-    const legend = `■ 敷地内の建物 ${shown}棟`;
-    const tx = Math.min(this.W - 8, fx + fw - 5);
-    const ty = Math.max(5, fy + 5);
-    c.lineWidth = 3;
-    c.strokeStyle = 'rgba(251,248,239,0.96)';
-    c.strokeText(legend, tx, ty);
-    c.fillStyle = '#52636d';
-    c.fillText(legend, tx, ty);
-    c.restore();
-  }
-
   // マップの水（池・プール）とテーマの飾り。敷地の外は描かない
   drawMapLand(toS, k) {
     const c = this.cx;
@@ -1071,8 +977,7 @@ export class Editor {
     c.font = `600 10px ${FONT}`;
     c.textAlign = 'right';
     c.textBaseline = 'middle';
-    const hStep = Math.max(10, Math.ceil(X.Hmax / 6 / 10) * 10);
-    for (let h = 0; h <= X.Hmax; h += hStep) {
+    for (let h = 0; h <= H_MAX; h += 10) {
       const y = X.hy(h);
       c.beginPath();
       c.moveTo(X.x0, y);
@@ -1221,7 +1126,7 @@ export class Editor {
       let acc = 0;
       for (let k = tr.stEnd; k < tr.n; k++) {
         const j = k - 1;
-        if (!(tr.fl[k] & F.LOOP)) acc += Math.hypot(tr.px[k] - tr.px[j], tr.pz[k] - tr.pz[j]);
+        if (!(tr.fl[k] & (F.LOOP | F.ROLL))) acc += Math.hypot(tr.px[k] - tr.px[j], tr.pz[k] - tr.pz[j]);
         u[k] = acc;
       }
       for (let k = tr.stEnd; k < tr.n; k++) u[k] = acc > 0 ? u[k] / acc : 0;
@@ -1235,16 +1140,17 @@ export class Editor {
     const c = this.cx;
     const d = this.design;
     const p = this.preview;
-    // 宙返りを置ける所・ジャンプが着地しやすい所（どちらもまっすぐな所）を、地面の上に緑の帯で出す。ジャンプはほかの所にも置ける
-    if (p && (this.tool === 'loop' || this.tool === 'jump')) {
+    // 宙返り・ひねりを置ける所・ジャンプが着地しやすい所（どれもまっすぐな所）を、地面の上に緑の帯で出す。ジャンプはほかの所にも置ける
+    if (p && BAND_TOOLS[this.tool]) {
       const key = `${this.tool}:${p.Lf}`;
       if (this.okKey !== key) {
         this.okKey = key;
-        const len = this.tool === 'loop' ? loopShape().adv : GIMMICKS.jump.len;
+        const st = this.tool !== 'jump';
+        const len = this.tool === 'loop' ? loopShape().adv : GIMMICKS[this.tool].len;
         this.okBand = [];
         for (let m = 0; m < p.Lf; m += 2) {
-          const t = this.tool === 'loop' ? turnOf(p.path, m - 10, m + len + 10) : turnOf(p.path, m - 6, m + len + 14);
-          this.okBand.push(t <= (this.tool === 'loop' ? 1.1 : 0.5) && m > 40 && m + len < p.Lf - 40);
+          const t = this.tool === 'drop' ? turnOf(p.path, m - 6, m + len + 6) : st ? turnOf(p.path, m - 10, m + len + 10) : turnOf(p.path, m - 6, m + len + 14);
+          this.okBand.push(t <= (this.tool === 'drop' ? DROP_TURN : st ? 1.1 : 0.5) && m > (this.tool === 'drop' ? 70 : 40) && m + len < p.Lf - 40);
         }
       }
       c.fillStyle = 'rgba(80,190,90,0.45)';
@@ -1257,11 +1163,19 @@ export class Editor {
     const placed = p ? placeGimmicks(d, p.Lf, p.path) : [];
     c.textAlign = 'center';
     c.textBaseline = 'middle';
-    const whys = new Set();
-    for (const g of d.gm) {
+    // 置けないしかけは、ほかの印の後ろに隠れないよう最後に（手前に）描き、名前と理由を出す
+    const ngs = new Map(); // 名前 → 理由
+    const okOf = (g) => {
       const q = placed.find((q) => q.u === g.u && q.t === g.t);
-      const ok = q && q.ok;
-      if (q && !ok) whys.add(q.why);
+      return { q, ok: q && q.ok };
+    };
+    const order = [...d.gm].sort((a, b) => (okOf(a).ok ? 0 : 1) - (okOf(b).ok ? 0 : 1));
+    for (const g of order) {
+      const { q, ok } = okOf(g);
+      if (q && !ok) {
+        const W = { near: 'ほかのしかけに近すぎ', edge: '駅に近すぎ', curve: 'カーブの上。まっすぐな所に' };
+        ngs.set(GIMMICKS[g.t].name, W[q.why] || '');
+      }
       const G = GIMMICKS[g.t];
       const x = X.ux(g.u);
       c.globalAlpha = ok ? 1 : 0.4;
@@ -1279,12 +1193,17 @@ export class Editor {
       }
       c.globalAlpha = 1;
     }
-    if (whys.size) {
-      const W = { near: 'ほかのしかけに近すぎ', edge: '駅に近すぎ', curve: 'カーブの上（宙返りはまっすぐな所に）' };
-      c.fillStyle = '#d02020';
+    if (ngs.size) {
+      const list = [...ngs].map(([name, why]) => `${name}（${why}）`);
       c.font = `700 11px ${FONT}`;
       c.textAlign = 'left';
-      c.fillText(`× 置けない：${[...whys].map((w) => W[w]).join('・')}`, X.x0 + 4, X.hy(0) - 8);
+      const msg = `× 置けない：${list.join('・')}`;
+      // 線と重なっても読めるよう、白い縁どり
+      c.lineWidth = 3;
+      c.strokeStyle = 'rgba(255,255,255,0.9)';
+      c.strokeText(msg, X.x0 + 4, X.hy(0) - 8);
+      c.fillStyle = '#d02020';
+      c.fillText(msg, X.x0 + 4, X.hy(0) - 8);
     }
   }
 
@@ -1302,12 +1221,6 @@ export class Editor {
     this.cv.setPointerCapture?.(e.pointerId);
     const [sx, sy] = this.pos(e);
     const d = this.design;
-    if (this.step === 1 && (e.shiftKey || e.button === 1)) {
-      const X = this.mapXf();
-      this.panning = { x: sx, y: sy, cx: this.mapView.cx, cz: this.mapView.cz, k: X.k, rot: X.rot };
-      this.drawing = true;
-      return;
-    }
     this.record();
     if (this.step === 1) {
       const { toW, k } = this.mapXf();
@@ -1341,10 +1254,7 @@ export class Editor {
       const u = X.toU(sx);
       // 近くのしかけをタップ → 外す
       const near = d.gm.findIndex((g) => Math.abs(X.ux(g.u) - sx) < 16);
-      if (near < 0 && d.gm.length >= MAX_GIMMICKS) {
-        this.undoStack.pop(); // 何も変わらない
-        this.toast(`しかけは最大${MAX_GIMMICKS}個です`, '', 'warn', 1800);
-      }
+      if (near < 0 && d.gm.length >= MAX_GIMMICKS) this.unrecord(); // 何も変わらない
       if (near >= 0) {
         d.gm.splice(near, 1);
         sound.sfx('erase');
@@ -1360,14 +1270,6 @@ export class Editor {
     e.preventDefault();
     const [sx, sy] = this.pos(e);
     const d = this.design;
-    if (this.panning) {
-      const p = this.panning;
-      const dx = sx - p.x, dy = sy - p.y;
-      this.mapView.cx = p.cx + (p.rot ? dy / p.k : -dx / p.k);
-      this.mapView.cz = p.cz + (p.rot ? -dx / p.k : -dy / p.k);
-      this.draw();
-      return;
-    }
     if (this.step === 1) {
       const { toW } = this.mapXf();
       const w = toW(sx, sy);
@@ -1391,7 +1293,7 @@ export class Editor {
         d.pts.push(w);
         if (d.pts.length % 6 === 0) sound.sfx('draw');
         // 全長の上限（線路が長すぎると重くなり、シェアの URL も長くなる）
-        if (d.pts.length > 8192 || polyLen(d.pts) > MAX_LEN) {
+        if (d.pts.length > 1400 || polyLen(d.pts) > MAX_LEN) {
           d.pts.pop();
           if (!this.maxed) {
             this.maxed = true;
@@ -1408,12 +1310,11 @@ export class Editor {
     this.pid = null;
     if (!this.drawing) return;
     this.drawing = false;
-    if (this.panning) { this.panning = null; return; }
     // 線の途中をタップしただけ（ほとんど動かしていない）：何も変えない
     const r = this.redraw;
     if (r && !r.moved) {
       this.design.pts = r.orig;
-      this.undoStack.pop();
+      this.unrecord();
     }
     this.redraw = null;
     this.refresh(true);

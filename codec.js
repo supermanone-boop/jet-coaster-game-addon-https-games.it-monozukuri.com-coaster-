@@ -1,33 +1,20 @@
 // codec.js — 設計（上から描いた道・高さ・しかけ・設定）を、URL に載せる短い文字列にする・戻す
 // 同じ文字列からは同じ線路・同じ結果になる（シミュレーションは決まった種の乱数で動く）。
-// 形：1 バイト目が版。高さは v3 で Float32、旧 v1/v2 の高さデータも読み込める。点は差分を可変長整数で保存する。
+// 形：1 バイト目が版。数は 0.5 m 単位に丸める。点は前の点との差を可変長の整数で詰める。
 // 点の後ろに装飾（見た目）の 2 バイト（線路の色・車両の色 / 乗る人・景色 を 3 ビットずつ）。
 // 装飾は後から足したので、無ければ今の見た目にする（古いリンクも開け、古い版のゲームは余りを読まない）。
 // その後ろにマップの 1 バイト（1.1.1 で足した。無ければいつもの遊園地）、
 // さらに線路の色・車両の色・乗る人の番号の上の 2 ビットずつの 1 バイト（1.1.3。テーマの見た目で 8 個を超えたため）。
-import { H_SAMPLES, H_MAX, H_MIN, FIELD, GIMMICK_KEYS, MATS, BARS, STARTS, MAX_GIMMICKS, MAX_CARS, MAPS } from './track.js';
+import { H_SAMPLES, H_MAX, H_MIN, FIELD, GIMMICK_KEYS, MATS, BARS, STARTS, MAX_GIMMICKS, MAX_CARS, MAPS, PHYS } from './track.js';
 import { cleanLook, defaultLook } from './looks.js';
 
-const VER = 3;
-const MAX_POINTS = 8192;
-const MAX_CODE_LENGTH = 180000;
-const OX_V1 = 80; // 旧共有URLの座標オフセット
-const OX_V2 = 601; // 拡張敷地 -600..600m を収める新オフセット
+const VER = 1;
+// 機能の番号：コースの文字列に入れる「このコースを開くのに要る機能」。しかけ・素材・見た目・値を足して、前の版のゲームでは
+// 正しく開けなくなるときは 1 つ上げる（前の版のゲームは「新しいバージョンのコースです」と出して、最新にするよう案内する）。
+// 1 = 1.3.0（ひねり・水しぶき・トンネル・垂直落下・物理の版 2）。末尾に足す値は、この後ろに足していく
+export const FEAT = 1;
+const OX = 80; // x, z をプラスにするためのずらし（m）
 
-function pushFloat32(out, value) {
-  let v = Number(value);
-  if (!Number.isFinite(v)) v = H_MIN;
-  v = Math.max(H_MIN, Math.min(3.4e38, v));
-  const buffer = new ArrayBuffer(4);
-  new DataView(buffer).setFloat32(0, v, true);
-  for (const byte of new Uint8Array(buffer)) out.push(byte);
-}
-function readFloat32(r) {
-  if (r.i + 4 > r.b.length) throw new Error('short');
-  const value = new DataView(r.b.buffer, r.b.byteOffset + r.i, 4).getFloat32(0, true);
-  r.i += 4;
-  return Number.isFinite(value) ? Math.max(H_MIN, value) : H_MIN;
-}
 function b64(bytes) {
   let s = '';
   for (const b of bytes) s += String.fromCharCode(b);
@@ -96,6 +83,8 @@ export function simplify(pts, tol = 0.35) {
   return a.filter((_, k) => keep[k]);
 }
 
+// 物理の版：知らない版（これより新しいゲームで作ったコース）は今の版で計算する
+export const cleanPhys = (v) => (Number.isInteger(v) && v >= 1 && v <= PHYS ? v : PHYS);
 export const cleanMap = (m) => (Number.isInteger(m) && m >= 0 && m < MAPS.length ? m : 0);
 
 export function encode(d) {
@@ -106,87 +95,111 @@ export function encode(d) {
     const u = Math.round(Math.min(1, Math.max(0, g.u)) * 4095);
     out.push(GIMMICK_KEYS.indexOf(g.t), u >> 8, u & 255);
   }
-  for (let k = 0; k < H_SAMPLES; k++) pushFloat32(out, d.hs?.[k] ?? 2);
-  const pts = d.pts.slice(0, MAX_POINTS);
+  for (let k = 0; k < H_SAMPLES; k++) out.push(Math.round(Math.min(H_MAX, Math.max(H_MIN, d.hs[k] ?? 2)) * 2));
+  const pts = d.pts.slice(0, 1500);
   out.push(pts.length >> 8, pts.length & 255);
   let px = 0;
   let pz = 0;
   for (const [x, z] of pts) {
-    const qx = Math.round((x + OX_V2) * 2);
-    const qz = Math.round((z + OX_V2) * 2);
+    const qx = Math.round((x + OX) * 2);
+    const qz = Math.round((z + OX) * 2);
     varint(out, qx - px);
     varint(out, qz - pz);
     px = qx;
     pz = qz;
   }
   const lk = cleanLook(d.look);
-  out.push((lk.rail & 7) | ((lk.car & 7) << 3), (lk.rider & 7) | (lk.scene << 3));
+  // トンネルの見た目（1.4.0）は、空いていた上の 2 ビットに 2 ビットずつ（下位を 4 バイト目、上位を 2 バイト目）。前の版のゲームでは無視される
+  out.push((lk.rail & 7) | ((lk.car & 7) << 3), (lk.rider & 7) | (lk.scene << 3) | ((lk.tunnel >> 2) << 6));
   out.push(cleanMap(d.map));
-  out.push((lk.rail >> 3) | ((lk.car >> 3) << 2) | ((lk.rider >> 3) << 4));
+  out.push((lk.rail >> 3) | ((lk.car >> 3) << 2) | ((lk.rider >> 3) << 4) | ((lk.tunnel & 3) << 6));
+  out.push(cleanPhys(d.pv ?? PHYS));
+  out.push(FEAT);
   return b64(out);
 }
 
-// 壊れた・いじられた文字列は null を返す
-export function decode(str) {
+// 壊れた・いじられた文字列は null を返す。
+// このゲームより新しい版で作られたコース（知らないしかけ・素材・必要な機能の番号が大きい）も null を返し、info.newer を true にする
+// （呼ぶ側は「新しいバージョンのコースです。最新にしてください」と出す。1.3.0〜）
+export function decode(str, info = {}) {
+  info.newer = false;
+  const newer = () => {
+    info.newer = true;
+    return null;
+  };
   try {
-    if (!str || str.length > MAX_CODE_LENGTH) return null;
+    if (!str || str.length > 6000) return null;
     const b = unb64(str);
     const r = { b, i: 0 };
     const rd = () => {
       if (r.i >= b.length) throw new Error('short');
       return b[r.i++];
     };
-    const version = rd();
-    if (version !== 1 && version !== 2 && version !== VER) return null;
-    const offset = version === 1 ? OX_V1 : OX_V2;
+    const ver = rd();
+    if (ver > VER) return newer();
+    if (ver !== VER) return null;
     const f = rd();
     const d = { mat: f & 3, bar: (f >> 2) & 3, start: (f >> 4) & 3, cars: rd(), gm: [], hs: [], pts: [] };
-    if (d.mat >= MATS.length || d.bar >= BARS.length || d.start >= STARTS.length) return null;
-    if (d.cars < 1 || d.cars > MAX_CARS) return null;
+    if (d.mat >= MATS.length || d.bar >= BARS.length || d.start >= STARTS.length) return newer();
+    if (d.cars < 1) return null;
+    if (d.cars > MAX_CARS) return newer();
     const ng = rd();
-    if (ng > MAX_GIMMICKS) return null;
+    if (ng > MAX_GIMMICKS) return newer();
     for (let k = 0; k < ng; k++) {
       const t = GIMMICK_KEYS[rd()];
       const u = ((rd() << 8) | rd()) / 4095;
-      if (!t) return null;
+      if (!t) return newer();
       d.gm.push({ t, u });
     }
-    if (version >= 3) {
-      for (let k = 0; k < H_SAMPLES; k++) d.hs.push(readFloat32(r));
-    } else {
-      for (let k = 0; k < H_SAMPLES; k++) d.hs.push(Math.max(H_MIN, rd() / 2));
-    }
+    for (let k = 0; k < H_SAMPLES; k++) d.hs.push(Math.min(H_MAX, Math.max(H_MIN, rd() / 2)));
     const n = (rd() << 8) | rd();
-    if (n < 2 || n > MAX_POINTS) return null;
+    if (n < 2 || n > 1500) return null;
     let px = 0;
     let pz = 0;
     for (let k = 0; k < n; k++) {
       px += readVarint(r);
       pz += readVarint(r);
-      const x = px / 2 - offset;
-      const z = pz / 2 - offset;
+      const x = px / 2 - OX;
+      const z = pz / 2 - OX;
       if (x < FIELD.x0 - 1 || x > FIELD.x1 + 1 || z < FIELD.z0 - 1 || z > FIELD.z1 + 1) return null;
       d.pts.push([x, z]);
     }
     d.look = defaultLook();
+    let tunHi = 0; // トンネルの見た目の上位 2 ビット（1.4.0）
     if (r.i + 2 <= b.length) {
       const a = b[r.i++];
       const c = b[r.i++];
       d.look = cleanLook({ rail: a & 7, car: (a >> 3) & 7, rider: c & 7, scene: (c >> 3) & 7 });
+      tunHi = c >> 6;
     }
     d.map = r.i < b.length ? cleanMap(b[r.i++]) : 0;
     if (r.i < b.length) {
       const e = b[r.i++];
       const l = d.look;
-      d.look = cleanLook({ ...l, rail: l.rail | ((e & 3) << 3), car: l.car | (((e >> 2) & 3) << 3), rider: l.rider | (((e >> 4) & 3) << 3) });
+      d.look = cleanLook({ ...l, rail: l.rail | ((e & 3) << 3), car: l.car | (((e >> 2) & 3) << 3), rider: l.rider | (((e >> 4) & 3) << 3), tunnel: (tunHi << 2) | (e >> 6) });
     }
+    // 物理の版（1.3.0）。無ければ 1（1.2.x までに作ったコース）
+    if (r.i < b.length) {
+      const pv = b[r.i++];
+      if (pv > PHYS) return newer();
+      d.pv = cleanPhys(pv);
+    } else d.pv = 1;
+    // このコースを開くのに要る機能の番号（1.3.0〜）。ゲームの FEAT より大きければ、新しい版のコース
+    if (r.i < b.length && b[r.i++] > FEAT) return newer();
     return d;
   } catch (e) {
     return null;
   }
 }
 
-// 丸めた形にそろえる（自分の画面とシェア先で、同じ数から計算するため）
+// 丸めた形にそろえる（自分の画面とシェア先で、同じ数から計算するため）。返す形には、丸めた点の並びの印（normed）を付ける。
+// すでに丸めた点の並びのまま（normed が今の点と同じ：シェアのリンク・お気に入り・走らせたコースの「なおす」で、道を描き直していない）なら、
+// 間引きをもう一度かけない。間引きは 1 回かけた形にもう一度かけると、さらに点が減って別のコースになる（1.2.x までは、シェア先・
+// お気に入りから走らせると、多くのコースで結果が変わっていた）。つづきから（描いている途中の形を保存したもの）は印がないので、前と同じく 1 回かける
+export const ptsKey = (pts) => pts.map((p) => `${p[0]},${p[1]}`).join(';');
 export function normalize(d) {
-  return decode(encode({ ...d, pts: simplify(d.pts) }));
+  const same = d.normed && d.normed === ptsKey(d.pts);
+  const q = same ? decode(encode(d)) : decode(encode({ ...d, pts: simplify(d.pts) }));
+  if (q) q.normed = ptsKey(q.pts);
+  return q;
 }
